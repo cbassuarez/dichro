@@ -1,11 +1,29 @@
-// Bauhaus Clickfield — Ripple Sequencer Edition
+// Bauhaus Clickfield — Ripple Sequencer with Audio
 // - Grid of clickable modules (circle/bar/block/diagonal).
 // - Ripple sequencer emanating from an origin tile (default: center).
-// - Long-press on a tile sets the origin.
-// - Scenes on Q/W/E/R (Shift+QWER to store).
-// - Palettes 1–4. N new seed. S save PNG+JSON.
-// - Global scale: Z/X. Brightness overlay: L/K.
-// - Space toggles play. G grid. H chrome on/off.
+// - Long-press on a tile sets origin.
+// - Web Audio-based tone "grains" per tile as ripple passes.
+// - Glyph type and color are independent properties.
+//
+// Controls:
+//   Click          : advance tile state
+//   Shift+click    : step state backwards
+//   Alt+click      : change glyph type
+//   Long-press     : set ripple origin tile
+//
+//   Space          : play/pause ripple
+//   , / .          : bpm down / up
+//
+//   Q/W/E/R        : recall scenes 0–3
+//   Shift+Q/W/E/R  : store scenes 0–3
+//   1–4            : palettes
+//   N              : new seed / reroll
+//   S              : save PNG + JSON snapshot
+//
+//   Z / X          : global scale up/down
+//   L / K          : global light/dark overlay
+//   G              : toggle grid overlay
+//   H              : toggle chrome
 
 // -------------------- config --------------------
 
@@ -66,7 +84,7 @@ let scenes = new Array(MAX_SCENES).fill(null);
 let showGrid = false;
 let showHUD = true;
 
-let shapeScale = 1.0;      // global shape size scalar
+let shapeScale = 1.0;      // global shape size
 let brightnessOverlay = 0; // -0.7..0.7
 
 // Ripple sequencer state
@@ -82,6 +100,10 @@ let rippleTimer = 0;
 // Pointer for long-press origin selection
 let pointerDownTile = null;
 let pointerDownTime = 0;
+
+// Web Audio
+let audioCtx = null;
+let masterGain = null;
 
 // -------------------- setup / draw --------------------
 
@@ -106,7 +128,6 @@ function draw() {
     updateRipple(dt);
   }
 
-  // tiles
   for (let i = 0; i < tiles.length; i++) {
     updateTile(tiles[i], dt);
     drawTile(tiles[i], palette);
@@ -140,7 +161,7 @@ function computeGridMetrics() {
 }
 
 function moduleTypeForCol(col) {
-  // Map columns into four bands: circle, bar, block, diagonal
+  // Columns still have a "voice" bias, but color is independent.
   const bandCount = MODULE_TYPES.length;
   const segment = floor(map(col, 0, GRID_COLS, 0, bandCount));
   return MODULE_TYPES[constrain(segment, 0, bandCount - 1)];
@@ -184,7 +205,6 @@ function buildTilesFromSeed() {
       const moduleType = moduleTypeForCol(col);
       const stateCount = moduleStateCount(moduleType);
       const initialState = pickInitialState(moduleType, row);
-      const role = pickRole();
 
       const { x0, y0, cellW, cellH } = gridMetrics;
       const x = x0 + col * cellW;
@@ -197,10 +217,10 @@ function buildTilesFromSeed() {
         y,
         w: cellW,
         h: cellH,
-        moduleType,
-        state: initialState,
+        moduleType,           // glyph type
+        state: initialState,  // glyph state
         stateCount,
-        role,
+        colorIndex: floor(random(3)), // 0: primary, 1: secondary, 2: accent
         animActive: false,
         animT: 1,
         animDuration: 0.22,
@@ -231,7 +251,10 @@ function updateTileGeometry() {
 
 function initRippleOrigin() {
   // Default to center cell
-  originTile = findTileAtGridIndex(floor(GRID_COLS / 2), floor(GRID_ROWS / 2)) || tiles[0] || null;
+  originTile =
+    findTileAtGridIndex(floor(GRID_COLS / 2), floor(GRID_ROWS / 2)) ||
+    tiles[0] ||
+    null;
   computeRippleRings();
   rippleIndex = 0;
   rippleTimer = 0;
@@ -262,7 +285,7 @@ function updateRipple(dt) {
   rippleTimer += dt;
 
   const secondsPerBeat = 60.0 / bpm;
-  const secondsPerRing = (secondsPerBeat / 2.0) / rippleSpeed; // 8th notes-ish; tweak as needed
+  const secondsPerRing = (secondsPerBeat / 2.0) / rippleSpeed; // 8ths-ish
 
   while (rippleTimer >= secondsPerRing) {
     rippleTimer -= secondsPerRing;
@@ -278,14 +301,8 @@ function updateRipple(dt) {
 }
 
 function handleRippleOnTile(tile) {
-  // Visual pulse
   triggerTileAnimation(tile, false);
-
-  // Audio hook (insert Web Audio / Tone.js here later)
-  // Example:
-  // triggerGrainFromTile(tile, rippleIndex, bpm);
-  // For now:
-  // console.log('ripple trigger', tile.row, tile.col, tile.moduleType, tile.state, tile.role);
+  triggerGrainFromTile(tile, rippleIndex);
 }
 
 // -------------------- tile logic --------------------
@@ -309,28 +326,14 @@ function randomModuleType() {
   return random(MODULE_TYPES);
 }
 
-function pickRole() {
-  const r = random();
-  if (r < 0.65) return 'primary';
-  if (r < 0.9) return 'secondary';
-  return 'accent';
-}
-
 function currentPalette() {
   return paletteDefs[paletteIndex % paletteDefs.length];
 }
 
 function getFillForTile(tile, palette) {
-  switch (tile.role) {
-    case 'primary':
-      return palette.primary;
-    case 'secondary':
-      return palette.secondary;
-    case 'accent':
-      return palette.accent;
-    default:
-      return palette.primary;
-  }
+  if (tile.colorIndex === 0) return palette.primary;
+  if (tile.colorIndex === 1) return palette.secondary;
+  return palette.accent;
 }
 
 function updateTile(tile, dt) {
@@ -351,7 +354,7 @@ function drawTile(tile, palette) {
   const baseColor = getFillForTile(tile, palette);
   const bg = palette.bg;
 
-  // Ripple ring highlight behind modules
+  // Ripple ring highlight
   if (isPlaying && tile.ring === rippleIndex) {
     push();
     noStroke();
@@ -389,7 +392,11 @@ function drawTile(tile, palette) {
 
   // Ghost / history overlay — faint inner frame for "hot" tiles
   if (tile.clickCount && tile.clickCount > 0) {
-    const influence = constrain(Math.log(tile.clickCount + 1) / Math.log(10), 0, 1);
+    const influence = constrain(
+      Math.log(tile.clickCount + 1) / Math.log(10),
+      0,
+      1
+    );
     const alpha = 30 * influence;
     noFill();
     stroke(0, 0, 0, alpha);
@@ -407,7 +414,6 @@ function drawTile(tile, palette) {
 
 function drawCircleModule(tile, size, baseColor, bgColor) {
   const state = tile.state;
-  const r = size * 0.5;
 
   noStroke();
 
@@ -642,6 +648,7 @@ function keyPressed() {
   // Transport
   if (key === ' ') {
     isPlaying = !isPlaying;
+    if (isPlaying) ensureAudioRunning();
     return;
   }
   if (key === ',') {
@@ -792,11 +799,19 @@ function drawChrome() {
   const bottomY = height - margin;
   const dot = isPlaying ? '●' : '○';
   const originLabel = originTile ? `${originTile.col},${originTile.row}` : '—';
-  text(`${dot} origin ${originLabel} · grid ${GRID_COLS}×${GRID_ROWS}`, margin, bottomY);
+  text(
+    `${dot} origin ${originLabel} · grid ${GRID_COLS}×${GRID_ROWS}`,
+    margin,
+    bottomY
+  );
 
   // bottom-right: key hints
   textAlign(RIGHT, BASELINE);
-  text(`[space] play · long-press tile: origin · [QWER] scenes · [?] help (H)`, width - margin, bottomY);
+  text(
+    `[space] play · long-press tile: origin · [QWER] scenes · [N] seed`,
+    width - margin,
+    bottomY
+  );
 }
 
 function chromeColorForBackground(bgHex) {
@@ -823,11 +838,13 @@ function storeScene(index) {
     tiles: tiles.map((t) => ({
       moduleType: t.moduleType,
       state: t.state,
-      role: t.role
+      colorIndex: t.colorIndex
     }))
   };
 
-  console.log(`Stored scene ${index} (palette: ${currentPalette().name}, seed: ${currentSeed})`);
+  console.log(
+    `Stored scene ${index} (palette: ${currentPalette().name}, seed: ${currentSeed})`
+  );
 }
 
 function recallScene(index) {
@@ -848,7 +865,7 @@ function recallScene(index) {
     tile.moduleType = snap.moduleType;
     tile.stateCount = moduleStateCount(tile.moduleType);
     tile.state = constrain(snap.state, 0, tile.stateCount - 1);
-    tile.role = snap.role;
+    tile.colorIndex = snap.colorIndex;
     triggerTileAnimation(tile, true);
   }
 
@@ -870,12 +887,117 @@ function saveComposition() {
       row: t.row,
       moduleType: t.moduleType,
       state: t.state,
-      role: t.role
+      colorIndex: t.colorIndex
     }))
   };
 
   console.log('Clickfield snapshot:', snapshot);
   console.log('JSON:', JSON.stringify(snapshot));
+}
+
+// -------------------- audio engine --------------------
+
+function initAudio() {
+  if (audioCtx && audioCtx.state !== 'closed') return;
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) {
+    console.warn('Web Audio API not supported in this browser.');
+    return;
+  }
+  audioCtx = new AudioCtx();
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = 0.18;
+  masterGain.connect(audioCtx.destination);
+}
+
+function ensureAudioRunning() {
+  if (!audioCtx) {
+    initAudio();
+  }
+  if (!audioCtx) return;
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+}
+
+function triggerGrainFromTile(tile, ringIndex) {
+  if (!audioCtx) return;
+
+  const ctx = audioCtx;
+  const now = ctx.currentTime;
+
+  // Map row to a simple pitch ladder (major-ish)
+  const scale = [0, 2, 4, 7, 9, 12]; // semitones
+  const degree = scale[tile.row % scale.length];
+  const octave = 3 + floor(tile.row / scale.length);
+  const midi = 12 * octave + degree; // rough MIDI note
+  let freq = 440 * Math.pow(2, (midi - 69) / 12);
+
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+  const ringNorm = maxRippleRing > 0 ? ringIndex / maxRippleRing : 0.0;
+
+  // Slight frequency warping by state
+  freq *= lerp(0.8, 1.4, 0.3 + 0.4 * stateNorm);
+
+  // Oscillator type based on glyph type
+  let type = 'sine';
+  if (tile.moduleType === 'bar') type = 'square';
+  else if (tile.moduleType === 'block') type = 'triangle';
+  else if (tile.moduleType === 'diagonal') type = 'sawtooth';
+
+  const osc = ctx.createOscillator();
+  osc.type = type;
+  osc.frequency.value = freq;
+
+  // Envelope & pan
+  const gain = ctx.createGain();
+  const panNode = ctx.createStereoPanner
+    ? ctx.createStereoPanner()
+    : null;
+
+  // Duration depends on module/state
+  let baseDur = 0.12;
+  if (tile.moduleType === 'circle') baseDur = 0.18;
+  if (tile.moduleType === 'bar') baseDur = 0.10;
+  if (tile.moduleType === 'block') baseDur = 0.16;
+  if (tile.moduleType === 'diagonal') baseDur = 0.14;
+
+  const dur = lerp(baseDur * 0.6, baseDur * 1.4, stateNorm);
+
+  // Velocity from colorIndex & ring distance
+  let vel = 0.12;
+  if (tile.colorIndex === 2) vel *= 1.4; // accent
+  if (tile.colorIndex === 1) vel *= 0.85; // secondary
+  vel *= lerp(0.8, 1.2, ringNorm);
+
+  const attack = 0.005;
+  const release = dur * 0.85;
+
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(vel, now + attack);
+  gain.gain.exponentialRampToValueAtTime(
+    0.0001,
+    now + attack + release
+  );
+
+  osc.start(now);
+  osc.stop(now + attack + release + 0.02);
+
+  if (panNode) {
+    const panVal = lerp(
+      -0.8,
+      0.8,
+      GRID_COLS > 1 ? tile.col / (GRID_COLS - 1) : 0.5
+    );
+    panNode.pan.setValueAtTime(panVal, now);
+    osc.connect(gain);
+    gain.connect(panNode);
+    panNode.connect(masterGain);
+  } else {
+    osc.connect(gain);
+    gain.connect(masterGain);
+  }
 }
 
 // -------------------- utils --------------------
