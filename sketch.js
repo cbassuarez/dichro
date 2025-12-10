@@ -618,8 +618,8 @@ triggerTileAnimation(tile, true);
     advanceTileState(tile, shift ? -1 : 1);
   }
 
-  // NEW: audible feedback on click
-  triggerGrainFromTile(tile, tile.ring || 0);
+    // audible feedback on click
+  triggerGrainFromTile(tile, 1.0);
 }
 
   pointerDownTile = null;
