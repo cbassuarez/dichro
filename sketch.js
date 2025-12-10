@@ -1,26 +1,16 @@
-// Bauhaus Clickfield
-// Click tiles to cycle states. Shift+click = step back. Alt/Option+click = change module type.
-// Palettes: 1–4. R = new layout. S = save PNG + JSON to console. G = grid. H = HUD.
+// Bauhaus Clickfield — Ripple Sequencer Edition
+// - Grid of clickable modules (circle/bar/block/diagonal).
+// - Ripple sequencer emanating from an origin tile (default: center).
+// - Long-press on a tile sets the origin.
+// - Scenes on Q/W/E/R (Shift+QWER to store).
+// - Palettes 1–4. N new seed. S save PNG+JSON.
+// - Global scale: Z/X. Brightness overlay: L/K.
+// - Space toggles play. G grid. H chrome on/off.
 
 // -------------------- config --------------------
 
 const GRID_COLS = 8;
 const GRID_ROWS = 6;
-const MAX_SCENES = 4;
-
-let scenes = new Array(MAX_SCENES).fill(null);
-
-let playMode = false;
-let sweep = {
-  pos: 0,
-  speed: 0.6,    // rows per second
-  width: 0.8,    // highlight band width in rows
-  autoAdvance: true
-};
-let prevSweepPos = 0;
-
-let shapeScale = 1.0;      // global shape size scalar
-let brightnessOverlay = 0; // -0.7..0.7, negative = darker, positive = lighter
 
 const paletteDefs = [
   {
@@ -54,13 +44,13 @@ const paletteDefs = [
 ];
 
 const MODULE_TYPES = ['circle', 'bar', 'block', 'diagonal'];
+const MAX_SCENES = 4;
+const LONG_PRESS_MS = 400;
 
 // -------------------- globals --------------------
 
 let tiles = [];
 let paletteIndex = 0;
-let showGrid = false;
-let showHUD = true;
 
 let gridMetrics = {
   x0: 0,
@@ -70,6 +60,28 @@ let gridMetrics = {
 };
 
 let currentSeed = 123456789;
+
+let scenes = new Array(MAX_SCENES).fill(null);
+
+let showGrid = false;
+let showHUD = true;
+
+let shapeScale = 1.0;      // global shape size scalar
+let brightnessOverlay = 0; // -0.7..0.7
+
+// Ripple sequencer state
+let isPlaying = false;
+let bpm = 96;
+let rippleSpeed = 1.0; // multiplier on bpm timing
+
+let originTile = null;
+let maxRippleRing = 0;
+let rippleIndex = 0;
+let rippleTimer = 0;
+
+// Pointer for long-press origin selection
+let pointerDownTile = null;
+let pointerDownTime = 0;
 
 // -------------------- setup / draw --------------------
 
@@ -81,49 +93,7 @@ function setup() {
 
   currentSeed = getSeedFromURL() ?? floor(random(1e9));
   buildTilesFromSeed();
-}
-
-function updateSweep(dt) {
-  prevSweepPos = sweep.pos;
-  sweep.pos += dt * sweep.speed;
-
-  // Wrap in [0, GRID_ROWS)
-  if (sweep.pos >= GRID_ROWS) sweep.pos -= GRID_ROWS;
-  if (sweep.pos < 0) sweep.pos += GRID_ROWS;
-
-  if (!sweep.autoAdvance) return;
-
-  // Auto-advance tiles once when the band’s center crosses a row center
-  for (let i = 0; i < tiles.length; i++) {
-    const tile = tiles[i];
-    const centerRow = tile.row + 0.5;
-
-    let prev = prevSweepPos;
-    let curr = sweep.pos;
-    let tileCenter = centerRow;
-
-    // handle wrap-around (always move "forward" in row space)
-    if (curr < prev) curr += GRID_ROWS;
-    if (tileCenter < prev) tileCenter += GRID_ROWS;
-
-    if (prev <= tileCenter && curr > tileCenter) {
-      advanceTileState(tile, +1);
-    }
-  }
-}
-
-function drawBrightnessOverlay() {
-  const amount = abs(brightnessOverlay);
-  if (amount <= 0.0001) return;
-
-  const alpha = map(amount, 0, 0.7, 0, 120);
-  noStroke();
-  if (brightnessOverlay > 0) {
-    fill(255, 255, 255, alpha);
-  } else {
-    fill(0, 0, 0, alpha);
-  }
-  rect(0, 0, width, height);
+  initRippleOrigin();
 }
 
 function draw() {
@@ -132,8 +102,8 @@ function draw() {
 
   const dt = deltaTime / 1000.0;
 
-  if (playMode) {
-    updateSweep(dt);
+  if (isPlaying) {
+    updateRipple(dt);
   }
 
   // tiles
@@ -151,7 +121,7 @@ function draw() {
   }
 
   if (showHUD) {
-    drawHUD();
+    drawChrome();
   }
 }
 
@@ -168,9 +138,10 @@ function computeGridMetrics() {
   gridMetrics.cellW = gridW / GRID_COLS;
   gridMetrics.cellH = gridH / GRID_ROWS;
 }
+
 function moduleTypeForCol(col) {
   // Map columns into four bands: circle, bar, block, diagonal
-  const bandCount = MODULE_TYPES.length; // 4
+  const bandCount = MODULE_TYPES.length;
   const segment = floor(map(col, 0, GRID_COLS, 0, bandCount));
   return MODULE_TYPES[constrain(segment, 0, bandCount - 1)];
 }
@@ -232,13 +203,16 @@ function buildTilesFromSeed() {
         role,
         animActive: false,
         animT: 1,
-        animDuration: 0.22, // seconds
+        animDuration: 0.22,
         animDirection: random([-1, 1]),
         clickCount: 0,
-        lastChangedFrame: -1
+        lastChangedFrame: -1,
+        ring: 0 // ripple ring index (Manhattan distance from origin)
       });
     }
   }
+
+  initRippleOrigin();
 }
 
 function updateTileGeometry() {
@@ -251,6 +225,67 @@ function updateTileGeometry() {
     t.w = cellW;
     t.h = cellH;
   }
+}
+
+// -------------------- ripple sequencer --------------------
+
+function initRippleOrigin() {
+  // Default to center cell
+  originTile = findTileAtGridIndex(floor(GRID_COLS / 2), floor(GRID_ROWS / 2)) || tiles[0] || null;
+  computeRippleRings();
+  rippleIndex = 0;
+  rippleTimer = 0;
+}
+
+function findTileAtGridIndex(col, row) {
+  for (let i = 0; i < tiles.length; i++) {
+    const t = tiles[i];
+    if (t.col === col && t.row === row) return t;
+  }
+  return null;
+}
+
+function computeRippleRings() {
+  if (!originTile) return;
+  maxRippleRing = 0;
+  for (let i = 0; i < tiles.length; i++) {
+    const t = tiles[i];
+    const dx = t.col - originTile.col;
+    const dy = t.row - originTile.row;
+    t.ring = abs(dx) + abs(dy); // Manhattan distance
+    if (t.ring > maxRippleRing) maxRippleRing = t.ring;
+  }
+}
+
+function updateRipple(dt) {
+  if (!originTile) return;
+  rippleTimer += dt;
+
+  const secondsPerBeat = 60.0 / bpm;
+  const secondsPerRing = (secondsPerBeat / 2.0) / rippleSpeed; // 8th notes-ish; tweak as needed
+
+  while (rippleTimer >= secondsPerRing) {
+    rippleTimer -= secondsPerRing;
+    rippleIndex = (rippleIndex + 1) % (maxRippleRing + 1);
+
+    for (let i = 0; i < tiles.length; i++) {
+      const tile = tiles[i];
+      if (tile.ring === rippleIndex) {
+        handleRippleOnTile(tile);
+      }
+    }
+  }
+}
+
+function handleRippleOnTile(tile) {
+  // Visual pulse
+  triggerTileAnimation(tile, false);
+
+  // Audio hook (insert Web Audio / Tone.js here later)
+  // Example:
+  // triggerGrainFromTile(tile, rippleIndex, bpm);
+  // For now:
+  // console.log('ripple trigger', tile.row, tile.col, tile.moduleType, tile.state, tile.role);
 }
 
 // -------------------- tile logic --------------------
@@ -316,25 +351,13 @@ function drawTile(tile, palette) {
   const baseColor = getFillForTile(tile, palette);
   const bg = palette.bg;
 
-  // Sweep highlight (behind the module)
-  if (playMode) {
-    const rowCenter = tile.row + 0.5;
-    let sweepPos = sweep.pos % GRID_ROWS;
-    if (sweepPos < 0) sweepPos += GRID_ROWS;
-
-    let d = abs(rowCenter - sweepPos);
-    // shortest distance accounting for wrap-around
-    d = min(d, GRID_ROWS - d);
-
-    let intensity = max(0, 1 - d / sweep.width);
-    if (intensity > 0) {
-      push();
-      noStroke();
-      const alpha = 18 * intensity;
-      fill(255, 255, 255, alpha);
-      rect(tile.x, tile.y, tile.w, tile.h);
-      pop();
-    }
+  // Ripple ring highlight behind modules
+  if (isPlaying && tile.ring === rippleIndex) {
+    push();
+    noStroke();
+    fill(255, 255, 255, 26);
+    rect(tile.x, tile.y, tile.w, tile.h);
+    pop();
   }
 
   // animation: gentle pulse + tiny rotation
@@ -378,10 +401,6 @@ function drawTile(tile, palette) {
   }
 
   pop();
-}
-function registerTileChange(tile) {
-  tile.clickCount = (tile.clickCount || 0) + 1;
-  tile.lastChangedFrame = frameCount;
 }
 
 // -------------------- module drawing --------------------
@@ -538,20 +557,35 @@ function drawDiagonalModule(tile, size, baseColor, bgColor) {
 // -------------------- interaction --------------------
 
 function mousePressed() {
+  pointerDownTile = findTileAt(mouseX, mouseY);
+  pointerDownTime = millis();
+}
+
+function mouseReleased() {
+  if (!pointerDownTile) return;
   const tile = findTileAt(mouseX, mouseY);
-  if (!tile) return;
+  const pressDuration = millis() - pointerDownTime;
 
-  const alt = keyIsDown(ALT);
-  const shift = keyIsDown(SHIFT);
+  if (tile && tile === pointerDownTile && pressDuration >= LONG_PRESS_MS) {
+    // Long press: set new origin for ripple
+    originTile = tile;
+    computeRippleRings();
+    rippleIndex = 0;
+    rippleTimer = 0;
+    triggerTileAnimation(tile, true);
+  } else if (tile && tile === pointerDownTile) {
+    // Short click: normal state changes
+    const alt = keyIsDown(ALT);
+    const shift = keyIsDown(SHIFT);
 
-  if (alt) {
-    // change module type
-    changeTileModule(tile);
-  } else {
-    // advance or step back in state
-    const direction = shift ? -1 : 1;
-    advanceTileState(tile, direction);
+    if (alt) {
+      changeTileModule(tile);
+    } else {
+      advanceTileState(tile, shift ? -1 : 1);
+    }
   }
+
+  pointerDownTile = null;
 }
 
 function findTileAt(px, py) {
@@ -580,6 +614,11 @@ function changeTileModule(tile) {
   triggerTileAnimation(tile, true);
 }
 
+function registerTileChange(tile) {
+  tile.clickCount = (tile.clickCount || 0) + 1;
+  tile.lastChangedFrame = frameCount;
+}
+
 function triggerTileAnimation(tile, hard) {
   tile.animActive = true;
   tile.animT = 0;
@@ -588,13 +627,29 @@ function triggerTileAnimation(tile, hard) {
 }
 
 function keyPressed() {
-  // HUD + grid toggles
+  // Toggle chrome
   if (key === 'H') {
     showHUD = !showHUD;
     return;
   }
+
+  // Grid overlay
   if (key === 'G') {
     showGrid = !showGrid;
+    return;
+  }
+
+  // Transport
+  if (key === ' ') {
+    isPlaying = !isPlaying;
+    return;
+  }
+  if (key === ',') {
+    bpm = max(20, bpm - 5);
+    return;
+  }
+  if (key === '.') {
+    bpm = min(240, bpm + 5);
     return;
   }
 
@@ -620,7 +675,7 @@ function keyPressed() {
     return;
   }
 
-  // New seed / reroll layout (moved from 'R' to 'N')
+  // New seed / reroll layout
   if (key === 'N') {
     currentSeed = floor(random(1e9));
     buildTilesFromSeed();
@@ -651,20 +706,6 @@ function keyPressed() {
     return;
   }
 
-  // Play mode + sweep
-  if (key === 'P') {
-    playMode = !playMode;
-    return;
-  }
-  if (key === '-') {
-    sweep.speed = max(0.1, sweep.speed - 0.1);
-    return;
-  }
-  if (key === '=') {
-    sweep.speed = min(3.0, sweep.speed + 0.1);
-    return;
-  }
-
   // Global scale macros
   if (key === 'Z') {
     shapeScale = constrain(shapeScale + 0.08, 0.7, 1.4);
@@ -691,7 +732,7 @@ function windowResized() {
   updateTileGeometry();
 }
 
-// -------------------- HUD & grid --------------------
+// -------------------- chrome & overlays --------------------
 
 function drawGridOverlay() {
   const { x0, y0, cellW, cellH } = gridMetrics;
@@ -699,7 +740,6 @@ function drawGridOverlay() {
   strokeWeight(1);
   noFill();
 
-  // inner grid
   for (let c = 0; c <= GRID_COLS; c++) {
     const x = x0 + c * cellW;
     line(x, y0, x, y0 + GRID_ROWS * cellH);
@@ -712,65 +752,65 @@ function drawGridOverlay() {
   noStroke();
 }
 
-function drawHUD() {
-  const palette = currentPalette();
-  const pad = 12;
-  const lineH = 16;
+function drawBrightnessOverlay() {
+  const amount = abs(brightnessOverlay);
+  if (amount <= 0.0001) return;
 
-    const lines = [
-    `palette: ${palette.name}`,
-    `seed: ${currentSeed}`,
-    `grid: ${GRID_COLS} × ${GRID_ROWS}`,
-    `mode: ${playMode ? 'play (sweep)' : 'edit (click)'}`,
-    `click: next · shift+click: back · alt+click: module`,
-    `[1–4] palette · [N] new seed · [S] save · [G] grid · [H] HUD`,
-    `[QWER] recall scenes · Shift+QWER store scenes`,
-    `[P] play sweep · [-/=] sweep speed · [Z/X] scale · [L/K] light/dark`
-  ];
-
-  const boxW = 380;
-  const boxH = lineH * lines.length + pad * 2;
-
-  // semi-opaque HUD box
-  fill(0, 0, 0, 140);
+  const alpha = map(amount, 0, 0.7, 0, 120);
   noStroke();
-  rect(pad, pad, boxW, boxH, 10);
+  if (brightnessOverlay > 0) {
+    fill(255, 255, 255, alpha);
+  } else {
+    fill(0, 0, 0, alpha);
+  }
+  rect(0, 0, width, height);
+}
 
-  fill(255, 240);
-  textAlign(LEFT, TOP);
-  textSize(12);
+function drawChrome() {
+  const palette = currentPalette();
+  const margin = 14;
+  const fontSize = 11;
 
-  for (let i = 0; i < lines.length; i++) {
-    text(lines[i], pad + 10, pad + 6 + i * lineH);
+  const fgCol = chromeColorForBackground(palette.bg);
+
+  noStroke();
+  fill(fgCol);
+
+  textSize(fontSize);
+  textAlign(LEFT, BASELINE);
+
+  const modeLabel = isPlaying ? 'ripple · playing' : 'ripple · stopped';
+  const titleLine = `CLICKFIELD · ${palette.name} · ${modeLabel} · bpm ${bpm}`;
+  text(titleLine, margin, margin + fontSize);
+
+  // top-right: seed
+  textAlign(RIGHT, BASELINE);
+  text(`seed ${currentSeed}`, width - margin, margin + fontSize);
+
+  // bottom-left: origin + grid
+  textAlign(LEFT, BASELINE);
+  const bottomY = height - margin;
+  const dot = isPlaying ? '●' : '○';
+  const originLabel = originTile ? `${originTile.col},${originTile.row}` : '—';
+  text(`${dot} origin ${originLabel} · grid ${GRID_COLS}×${GRID_ROWS}`, margin, bottomY);
+
+  // bottom-right: key hints
+  textAlign(RIGHT, BASELINE);
+  text(`[space] play · long-press tile: origin · [QWER] scenes · [?] help (H)`, width - margin, bottomY);
+}
+
+function chromeColorForBackground(bgHex) {
+  const c = color(bgHex);
+  const lum = 0.299 * red(c) + 0.587 * green(c) + 0.114 * blue(c);
+  const alpha = 200;
+  if (lum > 150) {
+    return color(0, 0, 0, alpha);
+  } else {
+    return color(255, 255, 255, alpha);
   }
 }
 
-// -------------------- save & snapshot --------------------
-
-function saveComposition() {
-  // image
-  const palette = currentPalette();
-  const filenameBase = `clickfield_${palette.name.replace(/\s+/g, '-')}_${currentSeed}`;
-  saveCanvas(filenameBase, 'png');
-
-  // JSON snapshot
-  const snapshot = {
-    seed: currentSeed,
-    paletteName: palette.name,
-    cols: GRID_COLS,
-    rows: GRID_ROWS,
-    tiles: tiles.map((t) => ({
-      col: t.col,
-      row: t.row,
-      moduleType: t.moduleType,
-      state: t.state,
-      role: t.role
-    }))
-  };
-
-  console.log('Clickfield snapshot:', snapshot);
-  console.log('JSON:', JSON.stringify(snapshot));
-}
+// -------------------- scenes & save --------------------
 
 function storeScene(index) {
   if (index < 0 || index >= MAX_SCENES) return;
@@ -811,6 +851,31 @@ function recallScene(index) {
     tile.role = snap.role;
     triggerTileAnimation(tile, true);
   }
+
+  computeRippleRings();
+}
+
+function saveComposition() {
+  const palette = currentPalette();
+  const filenameBase = `clickfield_${palette.name.replace(/\s+/g, '-')}_${currentSeed}`;
+  saveCanvas(filenameBase, 'png');
+
+  const snapshot = {
+    seed: currentSeed,
+    paletteName: palette.name,
+    cols: GRID_COLS,
+    rows: GRID_ROWS,
+    tiles: tiles.map((t) => ({
+      col: t.col,
+      row: t.row,
+      moduleType: t.moduleType,
+      state: t.state,
+      role: t.role
+    }))
+  };
+
+  console.log('Clickfield snapshot:', snapshot);
+  console.log('JSON:', JSON.stringify(snapshot));
 }
 
 // -------------------- utils --------------------
