@@ -88,14 +88,15 @@ let shapeScale = 1.0;      // global shape size
 let brightnessOverlay = 0; // -0.7..0.7
 
 // Ripple sequencer state
+// Ripple sequencer state
 let isPlaying = false;
 let bpm = 96;
 let rippleSpeed = 1.0; // multiplier on bpm timing
 
 let originTile = null;
-let maxRippleRing = 0;
-let rippleIndex = 0;
-let rippleTimer = 0;
+let maxRippleRing = 0;   // still tracked but not central
+let maxRippleDist = 0;   // max Euclidean distance from origin
+let ripplePhase = 0;     // continuous phase of the radial wave
 
 // Pointer for long-press origin selection
 let pointerDownTile = null;
@@ -256,8 +257,7 @@ function initRippleOrigin() {
     tiles[0] ||
     null;
   computeRippleRings();
-  rippleIndex = 0;
-  rippleTimer = 0;
+  ripplePhase = 0;
 }
 
 function findTileAtGridIndex(col, row) {
@@ -271,38 +271,57 @@ function findTileAtGridIndex(col, row) {
 function computeRippleRings() {
   if (!originTile) return;
   maxRippleRing = 0;
+  maxRippleDist = 0;
   for (let i = 0; i < tiles.length; i++) {
     const t = tiles[i];
     const dx = t.col - originTile.col;
     const dy = t.row - originTile.row;
-    t.ring = abs(dx) + abs(dy); // Manhattan distance
+    // keep ring if you ever want stepped modes later
+    t.ring = abs(dx) + abs(dy); // Manhattan distance (legacy)
+    const d = Math.sqrt(dx * dx + dy * dy); // Euclidean distance
+    t.dist = d;
+    t.prevAmp = 0;
+    t.currentAmp = 0;
     if (t.ring > maxRippleRing) maxRippleRing = t.ring;
+    if (d > maxRippleDist) maxRippleDist = d;
   }
 }
 
 function updateRipple(dt) {
   if (!originTile) return;
-  rippleTimer += dt;
 
-  const secondsPerBeat = 60.0 / bpm;
-  const secondsPerRing = (secondsPerBeat / 2.0) / rippleSpeed; // 8ths-ish
+  // continuous phase advance: bpm * rippleSpeed controls speed
+  const cyclesPerSecond = (bpm / 60) * rippleSpeed;
+  ripplePhase += dt * cyclesPerSecond * TWO_PI;
 
-  while (rippleTimer >= secondsPerRing) {
-    rippleTimer -= secondsPerRing;
-    rippleIndex = (rippleIndex + 1) % (maxRippleRing + 1);
+  const radialSpacing = PI / 2.0; // radians per unit of distance
+  const triggerThreshold = 0.7;
 
-    for (let i = 0; i < tiles.length; i++) {
-      const tile = tiles[i];
-      if (tile.ring === rippleIndex) {
-        handleRippleOnTile(tile);
-      }
+  for (let i = 0; i < tiles.length; i++) {
+    const tile = tiles[i];
+    if (tile.dist == null) continue;
+
+    const phaseAtTile = ripplePhase - tile.dist * radialSpacing;
+    // base cosine, shifted into [0, 1]
+    let amp = (Math.cos(phaseAtTile) + 1) * 0.5;
+    // sharpen the peak a little
+    amp = Math.pow(amp, 1.6);
+
+    const prev = tile.prevAmp ?? 0;
+    tile.currentAmp = amp;
+
+    // trigger when we cross threshold upward
+    if (prev < triggerThreshold && amp >= triggerThreshold) {
+      handleRippleOnTile(tile, amp);
     }
+
+    tile.prevAmp = amp;
   }
 }
 
-function handleRippleOnTile(tile) {
+function handleRippleOnTile(tile, amp) {
   triggerTileAnimation(tile, false);
-  triggerGrainFromTile(tile, rippleIndex);
+  triggerGrainFromTile(tile, amp);
 }
 
 // -------------------- tile logic --------------------
@@ -355,25 +374,34 @@ function drawTile(tile, palette) {
   const bg = palette.bg;
 
   // Ripple ring highlight
-  if (isPlaying && tile.ring === rippleIndex) {
+  const amp = isPlaying && tile.currentAmp != null ? tile.currentAmp : 0;
+
+  // Continuous ripple highlight: stronger amp = brighter
+  if (amp > 0.02) {
     push();
     noStroke();
-    fill(255, 255, 255, 26);
+    const alpha = 10 + 45 * amp;
+    fill(255, 255, 255, alpha);
     rect(tile.x, tile.y, tile.w, tile.h);
     pop();
   }
 
-  // animation: gentle pulse + tiny rotation
+
+  // animation: gentle pulse + tiny rotation, modulated by ripple amp
   let t = tile.animT;
   if (!tile.animActive) t = 1;
 
-  const pulse = 1 + 0.06 * sin(t * PI);
-  const rot = tile.animActive ? tile.animDirection * 0.08 * sin(t * PI) : 0;
+  const animWave = sin(t * PI);
+  const pulse = 1 + 0.04 * amp + 0.03 * animWave;
+  const rotBase = tile.animActive ? tile.animDirection * 0.08 * animWave : 0;
+  const rot = rotBase * (0.4 + 0.6 * amp);
 
   push();
   translate(cx, cy);
   scale(pulse);
   rotate(rot);
+
+
 
   switch (tile.moduleType) {
     case 'circle':
@@ -568,7 +596,6 @@ function mousePressed() {
   pointerDownTime = millis();
 }
 
-
 function mouseReleased() {
   if (!pointerDownTile) return;
   const tile = findTileAt(mouseX, mouseY);
@@ -577,10 +604,9 @@ function mouseReleased() {
   if (tile && tile === pointerDownTile && pressDuration >= LONG_PRESS_MS) {
     // Long press: set new origin for ripple
     originTile = tile;
-    computeRippleRings();
-    rippleIndex = 0;
-    rippleTimer = 0;
-    triggerTileAnimation(tile, true);
+computeRippleRings();
+ripplePhase = 0;
+triggerTileAnimation(tile, true);
   } else if (tile && tile === pointerDownTile) {
   // Short click: normal state changes
   const alt = keyIsDown(ALT);
@@ -926,7 +952,7 @@ function ensureAudioRunning() {
   }
 }
 
-function triggerGrainFromTile(tile, ringIndex) {
+function triggerGrainFromTile(tile, amp) {
   ensureAudioRunning();
   if (!audioCtx) return;
 
@@ -942,7 +968,8 @@ function triggerGrainFromTile(tile, ringIndex) {
 
   const stateNorm =
     tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
-  const ringNorm = maxRippleRing > 0 ? ringIndex / maxRippleRing : 0.0;
+  const distNorm = maxRippleDist > 0 ? (tile.dist || 0) / maxRippleDist : 0.0;
+  const energy = amp != null ? amp : 1.0;
 
   // Slight frequency warping by state
   freq *= lerp(0.8, 1.4, 0.3 + 0.4 * stateNorm);
@@ -972,11 +999,12 @@ function triggerGrainFromTile(tile, ringIndex) {
 
   const dur = lerp(baseDur * 0.6, baseDur * 1.4, stateNorm);
 
-  // Velocity from colorIndex & ring distance
-  let vel = 0.2;
+  // Velocity from colorIndex, distance and energy of the wave
+  let vel = 0.18;
   if (tile.colorIndex === 2) vel *= 1.4; // accent
   if (tile.colorIndex === 1) vel *= 0.85; // secondary
-  vel *= lerp(0.8, 1.2, ringNorm);
+  vel *= lerp(0.8, 1.2, distNorm);
+  vel *= lerp(0.6, 1.3, energy);
 
   const attack = 0.005;
   const release = dur * 0.85;
@@ -1006,7 +1034,6 @@ function triggerGrainFromTile(tile, ringIndex) {
     gain.connect(masterGain);
   }
 }
-
 // -------------------- utils --------------------
 
 function getSeedFromURL() {
