@@ -563,9 +563,11 @@ function drawDiagonalModule(tile, size, baseColor, bgColor) {
 // -------------------- interaction --------------------
 
 function mousePressed() {
+  ensureAudioRunning(); // wake audio on any click
   pointerDownTile = findTileAt(mouseX, mouseY);
   pointerDownTime = millis();
 }
+
 
 function mouseReleased() {
   if (!pointerDownTile) return;
@@ -580,16 +582,19 @@ function mouseReleased() {
     rippleTimer = 0;
     triggerTileAnimation(tile, true);
   } else if (tile && tile === pointerDownTile) {
-    // Short click: normal state changes
-    const alt = keyIsDown(ALT);
-    const shift = keyIsDown(SHIFT);
+  // Short click: normal state changes
+  const alt = keyIsDown(ALT);
+  const shift = keyIsDown(SHIFT);
 
-    if (alt) {
-      changeTileModule(tile);
-    } else {
-      advanceTileState(tile, shift ? -1 : 1);
-    }
+  if (alt) {
+    changeTileModule(tile);
+  } else {
+    advanceTileState(tile, shift ? -1 : 1);
   }
+
+  // NEW: audible feedback on click
+  triggerGrainFromTile(tile, tile.ring || 0);
+}
 
   pointerDownTile = null;
 }
@@ -647,9 +652,10 @@ function keyPressed() {
 
   // Transport
   if (key === ' ') {
-    isPlaying = !isPlaying;
-    if (isPlaying) ensureAudioRunning();
-    return;
+  ensureAudioRunning();
+  isPlaying = !isPlaying;
+  return;
+}
   }
   if (key === ',') {
     bpm = max(20, bpm - 5);
@@ -906,7 +912,7 @@ function initAudio() {
   }
   audioCtx = new AudioCtx();
   masterGain = audioCtx.createGain();
-  masterGain.gain.value = 0.18;
+  masterGain.gain.value = 0.3;
   masterGain.connect(audioCtx.destination);
 }
 
@@ -921,6 +927,7 @@ function ensureAudioRunning() {
 }
 
 function triggerGrainFromTile(tile, ringIndex) {
+  ensureAudioRunning();
   if (!audioCtx) return;
 
   const ctx = audioCtx;
@@ -966,7 +973,7 @@ function triggerGrainFromTile(tile, ringIndex) {
   const dur = lerp(baseDur * 0.6, baseDur * 1.4, stateNorm);
 
   // Velocity from colorIndex & ring distance
-  let vel = 0.12;
+  let vel = 0.2;
   if (tile.colorIndex === 2) vel *= 1.4; // accent
   if (tile.colorIndex === 1) vel *= 0.85; // secondary
   vel *= lerp(0.8, 1.2, ringNorm);
