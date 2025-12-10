@@ -1,65 +1,88 @@
-// Dichroic Beams — v1 skeleton
-// - Full-frame drifting beams
-// - Angle + interference-based dichroic color
-// - Keyboard controls for density, velocity, scale, breath, chrome, presets
-// - Seeded for reproducibility
+// Dichroic Light Pane — v2
+// Turrell-style luminous pane with dichroic beams, depth, and bloom.
+// Controls (default mapping):
+//   1–4         : Set target energy (low → high)
+//   [ and ]     : Nudge energy ±0.1
+//   C           : Cycle color modes
+//   R           : New random seed / arrangement
+//   SPACE       : Pause/unpause animation
+//   H           : Toggle HUD
+//   Mouse drag  : When mouseY is in top 15% of screen, X controls energy [0..1]
 
+let paneLayer;
+let bloomLayer;
+
+const MAX_BEAMS = 64;
 let beams = [];
-let params;
-let colorSets = {};
-let presets = {};
+
+let params = {
+  energy: 0.4,
+  targetEnergy: 0.4,
+  breath: 0.0,
+  breathPeriod: 18.0,   // seconds per breath
+  speedBase: 0.75,      // base temporal speed
+  depthScale: 1.6,      // perspective strength
+  bloomBlur: 18,        // px blur for bloom overlay
+  bloomStrength: 0.9,   // 0..1
+  vignetteStrength: 0.5 // 0..1
+};
 
 let time = 0;
-let breath = 0;
 let currentSeed = 12345;
 let paused = false;
 let showHUD = true;
 
-// ------------------------------------------------------------
-// Setup
-// ------------------------------------------------------------
+let colorModes = {};
+let activeModeName = 'turrellAmber';
+let modeOrder = [];
 
 function setup() {
   createCanvas(windowWidth, windowHeight);
-  colorMode(HSL, 360, 100, 100, 100);
-  noStroke();
+  pixelDensity(Math.min(2, window.devicePixelRatio || 1));
+  colorMode(HSL, 360, 100, 100, 1);
 
-  initColorSets();
-  initParamsAndPresets();
-
-  // Try to pull a seed from URL (?seed=12345), else use default
-  const seedFromURL = getSeedFromURL();
-  if (seedFromURL !== null) {
-    currentSeed = seedFromURL;
-  }
-
+  initColorModes();
+  createPaneLayers();
   reseed(currentSeed);
 }
-
-// ------------------------------------------------------------
-// Draw loop
-// ------------------------------------------------------------
 
 function draw() {
   if (!paused) {
     const dt = deltaTime / 1000.0;
-    const motionBase = 0.5 + params.velocity;
-    time += dt * motionBase;
+
+    // Smoothly approach target energy
+    const energyEase = 0.08;
+    params.energy += (params.targetEnergy - params.energy) * energyEase;
+    params.energy = constrain(params.energy, 0, 1);
+
+    // Time & breath
+    const speed = params.speedBase * (0.4 + 0.6 * params.energy);
+    time += dt * speed;
 
     const omega = TWO_PI / params.breathPeriod;
-    breath = sin(time * omega) * 0.5 + 0.5; // 0..1
+    params.breath = sin(time * omega) * 0.5 + 0.5; // 0..1
   }
 
-  // Trails background — low lightness, partial alpha
-  background(0, 0, params.backgroundLuminance, params.trailAlpha);
+  // Update and render into layers
+  paneLayer.clear();
+  bloomLayer.clear();
 
-  // Draw beams
-  for (let i = 0; i < beams.length; i++) {
-    drawBeam(beams[i]);
+  drawPaneBackground(paneLayer);
+
+  const activeCount = floor(map(params.energy, 0, 1, 10, MAX_BEAMS));
+  for (let i = 0; i < activeCount; i++) {
+    const beam = beams[i];
+    const geom = updateBeamAndProject(beam);
+
+    drawBeamOnLayer(paneLayer, beam, geom, false);
+    drawBeamOnLayer(bloomLayer, beam, geom, true);
   }
 
-  // Chrome / vignette overlay
-  drawVignette(params.chromeVignette, breath);
+  // Composite layers to main canvas
+  compositeLayers();
+
+  // Vignette / chrome collapse
+  drawVignette(params.vignetteStrength, params.breath);
 
   if (showHUD) {
     drawHUD();
@@ -67,216 +90,374 @@ function draw() {
 }
 
 // ------------------------------------------------------------
-// Initialization helpers
+// Initialization
 // ------------------------------------------------------------
 
-function initColorSets() {
-  // Approximate hue sets (H in 0..360)
-  colorSets = {
-    // 3M "Chill"-ish cool / gold-green-blue
-    chillCool: [210, 300, 60],
-    chillWarm: [45, 140, 210],
+function createPaneLayers() {
+  paneLayer = createGraphics(width, height);
+  paneLayer.colorMode(HSL, 360, 100, 100, 1);
 
-    // 3M "Blaze"-ish
-    blazeCool: [190, 220, 300],
-    blazeWarm: [0, 45],
-
-    // Simple dichroic-ish pairs
-    redPurple: [0, 290],
-    blueGreen: [210, 140],
-    amberTeal: [40, 180],
-
-    // Generic spectrum-ish
-    rainbow1: [0, 270],
-    rainbow2: [60, 200]
-  };
+  bloomLayer = createGraphics(width, height);
+  bloomLayer.colorMode(HSL, 360, 100, 100, 1);
 }
 
-function initParamsAndPresets() {
-  params = {
-    density: 0.6, // 0..1
-    maxBeams: 90,
-    velocity: 0.5, // 0..1
-    scale: 1.0, // ~0.3..1.5
-    breathAmp: 0.5, // 0..1
-    breathPeriod: 18.0, // seconds
-    chromeVignette: 0.4, // 0..1
-    activeColorSetName: 'chillCool',
-    backgroundLuminance: 5, // HSL lightness
-    trailAlpha: 20 // 0..100
-  };
+function initColorModes() {
+  // H, S, L are all 0..360 / 0..100 / 0..100
 
-  presets = {
-    chillCurtain: {
-      seed: 12345,
-      density: 0.7,
-      velocity: 0.4,
-      scale: 1.0,
-      breathAmp: 0.5,
-      chromeVignette: 0.35,
-      colorSet: 'chillCool'
+  colorModes = {
+    // Amber core, magenta/blue edges; Turrell-ish
+    turrellAmber: {
+      paneCore: { h: 35, s: 80, l: 55 },
+      paneEdge: { h: 290, s: 35, l: 8 },
+      pairs: [
+        [35, 310],  // amber ↔ magenta
+        [20, 280],  // warm amber ↔ violet
+        [45, 220]   // gold ↔ blue
+      ]
     },
-    chillWarmVeil: {
-      seed: 23456,
-      density: 0.6,
-      velocity: 0.3,
-      scale: 1.2,
-      breathAmp: 0.4,
-      chromeVignette: 0.25,
-      colorSet: 'chillWarm'
+
+    // Blue core, violet/green edges
+    turrellBlue: {
+      paneCore: { h: 205, s: 75, l: 55 },
+      paneEdge: { h: 300, s: 40, l: 8 },
+      pairs: [
+        [200, 280], // cyan/blue ↔ violet
+        [190, 330], // teal ↔ magenta
+        [210, 140]  // blue ↔ green
+      ]
     },
-    blazeCoolField: {
-      seed: 34567,
-      density: 0.8,
-      velocity: 0.6,
-      scale: 0.9,
-      breathAmp: 0.6,
-      chromeVignette: 0.45,
-      colorSet: 'blazeCool'
+
+    // 3M Chill-inspired (cool transmission, gold/green/blue reflection)
+    filmChill: {
+      paneCore: { h: 210, s: 70, l: 55 },
+      paneEdge: { h: 45, s: 60, l: 12 },
+      pairs: [
+        [210, 60],  // blue ↔ yellow
+        [300, 45],  // magenta ↔ gold
+        [140, 210]  // green ↔ blue
+      ]
     },
-    blazeWarmField: {
-      seed: 45678,
-      density: 0.75,
-      velocity: 0.5,
-      scale: 1.1,
-      breathAmp: 0.5,
-      chromeVignette: 0.5,
-      colorSet: 'blazeWarm'
-    },
-    redPurpleCross: {
-      seed: 56789,
-      density: 0.65,
-      velocity: 0.45,
-      scale: 1.1,
-      breathAmp: 0.55,
-      chromeVignette: 0.35,
-      colorSet: 'redPurple'
-    },
-    blueGreenDrift: {
-      seed: 67890,
-      density: 0.55,
-      velocity: 0.35,
-      scale: 1.3,
-      breathAmp: 0.45,
-      chromeVignette: 0.3,
-      colorSet: 'blueGreen'
+
+    // 3M Blaze-inspired (cyan/blue/magenta vs red/gold)
+    filmBlaze: {
+      paneCore: { h: 300, s: 75, l: 55 },
+      paneEdge: { h: 15, s: 70, l: 10 },
+      pairs: [
+        [190, 0],   // cyan ↔ red
+        [220, 45],  // blue ↔ gold
+        [300, 15]   // magenta ↔ warm red
+      ]
     }
   };
-}
 
-// ------------------------------------------------------------
-// Seeding & beams
-// ------------------------------------------------------------
+  modeOrder = Object.keys(colorModes);
+  activeModeName = modeOrder[0];
+}
 
 function reseed(seed) {
   currentSeed = seed;
   randomSeed(seed);
   noiseSeed(seed);
 
-  const numBeams = floor(params.maxBeams * params.density);
   beams = [];
 
+  const mode = colorModes[activeModeName];
   const w = width;
   const h = height;
 
-  for (let i = 0; i < numBeams; i++) {
-    const bx = random(-w * 0.2, w * 1.2);
-    const by = random(-h * 0.2, h * 1.2);
-    const baseLen = random(w * 0.5, w * 1.4);
-    const baseWidth = baseLen * random(0.015, 0.05);
-    const angleBase = random(-PI, PI);
+  // World coordinates are centered around (0,0) for easy projection
+  const rangeX = w * 0.4;
+  const rangeY = h * 0.4;
 
-    const beam = {
-      x: bx,
-      y: by,
-      length: baseLen,
-      width: baseWidth,
-      angleBase: angleBase,
-      angleNoiseAmp: random(0.15, 0.45),
-      posNoiseSeed: random(1000),
-      rotNoiseSeed: random(1000),
+  for (let i = 0; i < MAX_BEAMS; i++) {
+    const dirBase = random(-PI / 10, PI / 10); // almost-vertical beams
+
+    const lengthBase = random(h * 0.9, h * 1.6);
+    const widthBase = random(10, 42);
+
+    const slideRadius = random(h * 0.05, h * 0.18);
+    const slideSpeed = random(0.15, 0.5);
+
+    const z0 = random(); // 0..1, near ←→ far
+    const zAmp = random(0.05, 0.22);
+    const zSpeed = random(0.08, 0.3);
+
+    const rotAmp = random(radians(3), radians(10));
+    const rotSpeed = random(0.06, 0.25);
+
+    const x0 = random(-rangeX, rangeX);
+    const y0 = random(-rangeY, rangeY);
+
+    const pairIndex = floor(random(mode.pairs.length));
+    const noiseSeedLocal = random(1000);
+
+    beams.push({
+      x0,
+      y0,
+      z0,
+      dirAngle: dirBase,
+      lengthBase,
+      widthBase,
+      slideRadius,
+      slideSpeed,
+      zAmp,
+      zSpeed,
+      rotAmp,
+      rotSpeed,
       phase: random(TWO_PI),
-      layer: random() // 0..1
-    };
-
-    beams.push(beam);
+      zPhase: random(TWO_PI),
+      rotPhase: random(TWO_PI),
+      pairIndex,
+      noiseSeed: noiseSeedLocal
+    });
   }
 }
 
-function applyPreset(name) {
-  const p = presets[name];
-  if (!p) return;
+// ------------------------------------------------------------
+// Scene and layers
+// ------------------------------------------------------------
 
-  params.density = p.density;
-  params.velocity = p.velocity;
-  params.scale = p.scale;
-  params.breathAmp = p.breathAmp;
-  params.chromeVignette = p.chromeVignette;
-  params.activeColorSetName = p.colorSet;
+function drawPaneBackground(pg) {
+  const mode = colorModes[activeModeName];
+  const core = mode.paneCore;
+  const edge = mode.paneEdge;
 
-  reseed(p.seed);
+  const ctx = pg.drawingContext;
+  const w = pg.width;
+  const h = pg.height;
+  const cx = w / 2;
+  const cy = h / 2;
+  const radius = Math.max(w, h) * 0.7;
+
+  const brightnessBoost = 0.7 + 0.3 * params.energy;
+
+  const grad = ctx.createRadialGradient(
+    cx, cy, radius * 0.1,
+    cx, cy, radius
+  );
+
+  grad.addColorStop(
+    0,
+    hslToCSS(core.h, core.s, core.l * brightnessBoost, 1.0)
+  );
+  grad.addColorStop(
+    1,
+    hslToCSS(edge.h, edge.s, edge.l, 1.0)
+  );
+
+  ctx.save();
+  ctx.fillStyle = grad;
+
+  // Gentle breathing scale for the whole pane
+  const s = 1.0 + (params.breath - 0.5) * 0.04; // ±4%
+  ctx.translate(cx, cy);
+  ctx.scale(1.0, s);
+  ctx.translate(-cx, -cy);
+
+  ctx.fillRect(0, 0, w, h);
+  ctx.restore();
 }
 
-// ------------------------------------------------------------
-// Beam rendering
-// ------------------------------------------------------------
+function updateBeamAndProject(beam) {
+  const t = time;
+  const motionEnergy = 0.5 + 0.7 * params.energy;
 
-function drawBeam(beam) {
-  const motionFactor = 0.5 + params.velocity;
+  // Slide along direction
+  const slidePhase = t * beam.slideSpeed * motionEnergy + beam.phase;
+  const slide = sin(slidePhase) * beam.slideRadius;
+  const dxSlide = cos(beam.dirAngle) * slide;
+  const dySlide = sin(beam.dirAngle) * slide;
 
-  // Noise-driven position
-  const posT = time * 0.05 * motionFactor + beam.phase;
-  const nx = noise(beam.posNoiseSeed, posT);
-  const ny = noise(beam.posNoiseSeed + 100, posT);
+  // Depth oscillation
+  const zPhase = t * beam.zSpeed * motionEnergy + beam.zPhase;
+  const zOffset = sin(zPhase) * beam.zAmp;
+  const z = constrain(beam.z0 + zOffset, 0.0, 1.0);
 
-  const driftRadius = 40 * params.scale;
-  const dx = map(nx, 0, 1, -driftRadius, driftRadius);
-  const dy = map(ny, 0, 1, -driftRadius, driftRadius);
+  // Rotation oscillation
+  const rotPhase = t * beam.rotSpeed * motionEnergy + beam.rotPhase;
+  const angle = beam.dirAngle + sin(rotPhase) * beam.rotAmp;
 
-  const px = beam.x + dx;
-  const py = beam.y + dy;
+  // World position (0,0 at pane center)
+  const worldX = beam.x0 + dxSlide;
+  const worldY = beam.y0 + dySlide;
 
-  // Noise-driven rotation
-  const rotT = time * 0.03 * motionFactor + beam.phase;
-  const nr = noise(beam.rotNoiseSeed, rotT);
-  const angle = beam.angleBase + (nr - 0.5) * 2 * beam.angleNoiseAmp;
+  // Perspective projection
+  const depthScale = params.depthScale;
+  const persp = 1.0 + z * depthScale;
+  const px = worldX / persp;
+  const py = worldY / persp;
 
-  // Scale with breath
-  const scaleFactor = params.scale * lerp(0.8, 1.2, breath * params.breathAmp);
-  const len = beam.length * scaleFactor;
-  const w = beam.width * scaleFactor;
+  // Length & thickness scale with depth and energy
+  const energyScale = 0.7 + 0.6 * params.energy;
+  const length = beam.lengthBase / persp * energyScale;
+  const thickness = beam.widthBase / persp * (0.8 + 0.7 * params.energy);
 
-  // Color sets / dichroic mapping
-  const set = colorSets[params.activeColorSetName];
-  if (!set || set.length === 0) return;
+  return {
+    px,
+    py,
+    angle,
+    z,
+    length,
+    thickness
+  };
+}
 
-  // Angle-based step index
-  let uAngle = (angle + PI) / TWO_PI; // 0..1
-  uAngle = constrain(uAngle, 0, 0.999999);
-  let idx = floor(uAngle * set.length);
-  if (idx < 0) idx = 0;
-  if (idx >= set.length) idx = set.length - 1;
+function drawBeamOnLayer(pg, beam, geom, isBloom) {
+  const { px, py, angle, z, length, thickness } = geom;
+  const mode = colorModes[activeModeName];
 
-  const hBase = set[idx];
+  pg.push();
+  pg.translate(pg.width / 2, pg.height / 2);
+  pg.translate(px, py);
+  pg.rotate(angle);
 
-  // Interference field at beam center
-  const nField = noise(px * 0.0015, py * 0.0015, time * 0.05);
-  const hNext = set[(idx + 1) % set.length];
-  const blend = nField;
+  const ctx = pg.drawingContext;
+  ctx.save();
 
-  const h = lerpHue(hBase, hNext, blend);
-  const sat = lerp(40, 90, nField);
-  const baseL = 55 + (beam.layer - 0.5) * 10;
-  const l = baseL * lerp(0.7, 1.2, breath);
+  if (isBloom) {
+    // Soft, thicker shape in bloom layer
+    const colorForBloom = computeBeamCoreColor(beam, z, mode);
+    ctx.fillStyle = hslToCSS(
+      colorForBloom.h,
+      colorForBloom.s,
+      colorForBloom.l,
+      0.55 + 0.35 * params.energy
+    );
 
-  fill(h, sat, l, 90);
+    const len = length * 1.15;
+    const w = thickness * 1.6;
 
-  // Draw the beam
+    ctx.beginPath();
+    if (ctx.roundRect) {
+      ctx.roundRect(-len / 2, -w / 2, len, w, w * 0.55);
+    } else {
+      ctx.rect(-len / 2, -w / 2, len, w);
+    }
+    ctx.fill();
+  } else {
+    // Crisp gradient beam in pane layer
+    const grad = createBeamGradient(ctx, beam, z, mode, thickness);
+    ctx.fillStyle = grad;
+
+    const len = length;
+    const w = thickness;
+
+    ctx.beginPath();
+    if (ctx.roundRect) {
+      ctx.roundRect(-len / 2, -w / 2, len, w, w * 0.55);
+    } else {
+      ctx.rect(-len / 2, -w / 2, len, w);
+    }
+    ctx.fill();
+  }
+
+  ctx.restore();
+  pg.pop();
+}
+
+function createBeamGradient(ctx, beam, z, mode, thickness) {
+  const pairs = mode.pairs;
+  const pair = pairs[beam.pairIndex % pairs.length];
+  const [h1, h2] = pair;
+
+  const n = noise(beam.noiseSeed, time * 0.12);
+  const depthFactor = z;
+
+  // Hue progression across width
+  const hEdge1 = lerpHue(h1, h2, 0.10 + 0.10 * n);
+  const hCore = lerpHue(
+    h1,
+    h2,
+    0.5 +
+      (depthFactor - 0.5) * 0.25 + // deeper beams shift toward one end
+      (n - 0.5) * 0.18            // interference shimmer
+  );
+  const hEdge2 = lerpHue(h1, h2, 0.90 - 0.10 * n);
+
+  const energy = params.energy;
+  const satCore = 60 + 25 * energy;
+  const satEdge = 45 + 12 * energy;
+
+  const baseL = map(1 - depthFactor, 0, 1, 32, 72);
+  const lCore = baseL * (0.9 + 0.35 * energy);
+  const lEdge = baseL * 0.82;
+
+  const halfW = thickness / 2;
+  const grad = ctx.createLinearGradient(0, -halfW, 0, halfW);
+
+  // Edges are more transparent so center feels luminous.
+  grad.addColorStop(
+    0.0,
+    hslToCSS(hEdge1, satEdge, lEdge, 0.0 + 0.45 * energy)
+  );
+  grad.addColorStop(
+    0.18,
+    hslToCSS(hEdge1, satCore * 0.95, lCore * 0.9, 0.6 + 0.3 * energy)
+  );
+  grad.addColorStop(
+    0.5,
+    hslToCSS(hCore, satCore, lCore, 1.0)
+  );
+  grad.addColorStop(
+    0.82,
+    hslToCSS(hEdge2, satCore * 0.95, lCore * 0.9, 0.6 + 0.3 * energy)
+  );
+  grad.addColorStop(
+    1.0,
+    hslToCSS(hEdge2, satEdge, lEdge, 0.0 + 0.45 * energy)
+  );
+
+  return grad;
+}
+
+function computeBeamCoreColor(beam, z, mode) {
+  const pairs = mode.pairs;
+  const pair = pairs[beam.pairIndex % pairs.length];
+  const [h1, h2] = pair;
+
+  const depthFactor = z;
+  const n = noise(beam.noiseSeed + 57.3, time * 0.11);
+
+  const hue = lerpHue(
+    h1,
+    h2,
+    0.5 +
+      (depthFactor - 0.5) * 0.3 +
+      (n - 0.5) * 0.2
+  );
+
+  const energy = params.energy;
+  const sat = 65 + 25 * energy;
+  const baseL = map(1 - depthFactor, 0, 1, 40, 78);
+  const l = baseL * (0.9 + 0.35 * energy);
+
+  return { h: hue, s: sat, l };
+}
+
+function compositeLayers() {
+  // Base clear
+  clear();
+
+  // Pane layer (crisp beams + pane background)
+  image(paneLayer, 0, 0, width, height);
+
+  // Bloom layer (blurred overlay, additive/screen)
   push();
-  translate(px, py);
-  rotate(angle);
-  rectMode(CENTER);
-  rect(0, 0, len, w, w * 0.5);
+  const ctx = drawingContext;
+  ctx.save();
+
+  ctx.globalCompositeOperation = 'screen';
+  ctx.filter = `blur(${params.bloomBlur}px)`;
+  ctx.globalAlpha = params.bloomStrength;
+
+  image(bloomLayer, 0, 0, width, height);
+
+  // Reset
+  ctx.filter = 'none';
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1.0;
+
+  ctx.restore();
   pop();
 }
 
@@ -288,16 +469,18 @@ function drawVignette(strength, breathValue) {
   if (strength <= 0.001) return;
 
   const steps = 10;
-  const baseAlpha = 50 * strength * (0.8 + 0.4 * breathValue); // slight breathing
+  const baseAlpha = 0.8 * strength * (0.8 + 0.4 * breathValue);
 
   noStroke();
   for (let i = 0; i < steps; i++) {
     const t = i / (steps - 1);
     const alpha = (baseAlpha * t) / steps;
+
     fill(0, 0, 0, alpha);
 
-    const marginX = (width * 0.5) * t;
-    const marginY = (height * 0.5) * t;
+    const marginX = (width * 0.50) * t;
+    const marginY = (height * 0.50) * t;
+
     rect(marginX, marginY, width - 2 * marginX, height - 2 * marginY);
   }
 }
@@ -311,27 +494,23 @@ function drawHUD() {
   const lineH = 14;
 
   const hudText = [
+    `mode: ${activeModeName}`,
     `seed: ${currentSeed}`,
-    `preset: ${getPresetNameForCurrent() || 'custom'}`,
-    `density (Q/W): ${params.density.toFixed(2)}`,
-    `velocity (A/S): ${params.velocity.toFixed(2)}`,
-    `scale (Z/X): ${params.scale.toFixed(2)}`,
-    `breath (E/R): ${params.breathAmp.toFixed(2)}`,
-    `chrome (D/F): ${params.chromeVignette.toFixed(2)}`,
-    `color: ${params.activeColorSetName}`,
-    `[SPACE] pause · [H] HUD · [C] clear · [N] new seed`,
-    `[1–6] presets`
+    `energy (1–4, [ ]): ${params.energy.toFixed(2)}`,
+    `breath: ${params.breath.toFixed(2)}`,
+    `beams: ${floor(map(params.energy, 0, 1, 10, MAX_BEAMS))}`,
+    `[C] color mode  [R] reseed  [SPACE] pause`,
+    `[H] HUD  | mouse drag top strip = energy`
   ];
 
-  const boxWidth = 280;
+  const boxWidth = 320;
   const boxHeight = lineH * hudText.length + pad * 2;
 
-  // Semi-transparent background
-  fill(0, 0, 0, 50);
+  fill(0, 0, 0, 0.55);
   noStroke();
   rect(pad, pad, boxWidth, boxHeight, 8);
 
-  fill(0, 0, 90, 90);
+  fill(0, 0, 90, 0.95);
   textAlign(LEFT, TOP);
   textSize(11);
 
@@ -340,114 +519,80 @@ function drawHUD() {
   }
 }
 
-function getPresetNameForCurrent() {
-  const names = Object.keys(presets);
-  for (let i = 0; i < names.length; i++) {
-    const name = names[i];
-    const p = presets[name];
-    if (
-      p.seed === currentSeed &&
-      approxEqual(p.density, params.density) &&
-      approxEqual(p.velocity, params.velocity) &&
-      approxEqual(p.scale, params.scale) &&
-      approxEqual(p.breathAmp, params.breathAmp) &&
-      approxEqual(p.chromeVignette, params.chromeVignette) &&
-      p.colorSet === params.activeColorSetName
-    ) {
-      return name;
-    }
-  }
-  return null;
-}
-
 // ------------------------------------------------------------
-// Key controls
+// Interaction
 // ------------------------------------------------------------
 
 function keyPressed() {
-  // Space: pause/unpause
   if (key === ' ') {
     paused = !paused;
     return;
   }
 
   switch (key) {
-    // Density
-    case 'Q':
-      adjustDensity(-0.05);
-      break;
-    case 'W':
-      adjustDensity(0.05);
-      break;
-
-    // Velocity
-    case 'A':
-      params.velocity = constrain(params.velocity - 0.05, 0.0, 1.0);
-      break;
-    case 'S':
-      params.velocity = constrain(params.velocity + 0.05, 0.0, 1.0);
-      break;
-
-    // Scale
-    case 'Z':
-      params.scale = constrain(params.scale - 0.05, 0.3, 1.5);
-      break;
-    case 'X':
-      params.scale = constrain(params.scale + 0.05, 0.3, 1.5);
-      break;
-
-    // Breath amplitude
-    case 'E':
-      params.breathAmp = constrain(params.breathAmp - 0.05, 0.0, 1.0);
-      break;
-    case 'R':
-      params.breathAmp = constrain(params.breathAmp + 0.05, 0.0, 1.0);
-      break;
-
-    // Chrome / vignette
-    case 'D':
-      params.chromeVignette = constrain(params.chromeVignette - 0.05, 0.0, 1.0);
-      break;
-    case 'F':
-      params.chromeVignette = constrain(params.chromeVignette + 0.05, 0.0, 1.0);
-      break;
-
-    // Presets
+    // Energy scenes: low → high
     case '1':
-      applyPreset('chillCurtain');
+      params.targetEnergy = 0.18;
       break;
     case '2':
-      applyPreset('chillWarmVeil');
+      params.targetEnergy = 0.4;
       break;
     case '3':
-      applyPreset('blazeCoolField');
+      params.targetEnergy = 0.7;
       break;
     case '4':
-      applyPreset('blazeWarmField');
-      break;
-    case '5':
-      applyPreset('redPurpleCross');
-      break;
-    case '6':
-      applyPreset('blueGreenDrift');
+      params.targetEnergy = 1.0;
       break;
 
-    // HUD toggle
+    // Nudge energy
+    case '[':
+      params.targetEnergy = constrain(params.targetEnergy - 0.1, 0, 1);
+      break;
+    case ']':
+      params.targetEnergy = constrain(params.targetEnergy + 0.1, 0, 1);
+      break;
+
+    // Cycle color modes
+    case 'C':
+      cycleColorMode();
+      break;
+
+    // Reseed arrangement
+    case 'R':
+      reseed(floor(random(1e9)));
+      break;
+
+    // Toggle HUD
     case 'H':
       showHUD = !showHUD;
       break;
-
-    // Clear trails
-    case 'C':
-      clearTrails();
-      break;
-
-    // New random seed
-    case 'N':
-      reseed(floor(random(1e9)));
-      console.log('New seed:', currentSeed);
-      break;
   }
+}
+
+// Mouse drag in top strip = direct energy control
+function mouseDragged() {
+  if (mouseY < height * 0.15) {
+    const e = constrain(mouseX / width, 0, 1);
+    params.targetEnergy = e;
+  }
+}
+
+function mousePressed() {
+  if (mouseY < height * 0.15) {
+    const e = constrain(mouseX / width, 0, 1);
+    params.targetEnergy = e;
+  }
+}
+
+// ------------------------------------------------------------
+// Color mode cycling
+// ------------------------------------------------------------
+
+function cycleColorMode() {
+  const idx = modeOrder.indexOf(activeModeName);
+  const nextIdx = (idx + 1) % modeOrder.length;
+  activeModeName = modeOrder[nextIdx];
+  reseed(currentSeed);
 }
 
 // ------------------------------------------------------------
@@ -456,45 +601,20 @@ function keyPressed() {
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+  createPaneLayers();
   reseed(currentSeed);
 }
 
 // ------------------------------------------------------------
-// Utility functions
+// Utilities
 // ------------------------------------------------------------
 
-function adjustDensity(delta) {
-  params.density = constrain(params.density + delta, 0.1, 1.0);
-  reseed(currentSeed);
+function hslToCSS(h, s, l, a = 1.0) {
+  return `hsla(${h}, ${s}%, ${l}%, ${a})`;
 }
 
-function clearTrails() {
-  // Full clear this frame
-  background(0, 0, params.backgroundLuminance, 100);
-}
-
-// Circular hue lerp (degrees)
+// Circular hue interpolation (degrees)
 function lerpHue(a, b, t) {
   let delta = ((b - a + 540) % 360) - 180; // shortest path
   return (a + delta * t + 360) % 360;
-}
-
-// Approximate float equality
-function approxEqual(a, b, eps = 0.01) {
-  return Math.abs(a - b) < eps;
-}
-
-// Try to extract ?seed=1234 from the URL; returns number or null
-function getSeedFromURL() {
-  if (typeof window === 'undefined') return null;
-  try {
-    const url = new URL(window.location.href);
-    const seedParam = url.searchParams.get('seed');
-    if (!seedParam) return null;
-    const n = parseInt(seedParam, 10);
-    if (Number.isNaN(n)) return null;
-    return n;
-  } catch (e) {
-    return null;
-  }
 }
