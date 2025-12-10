@@ -676,12 +676,11 @@ function keyPressed() {
     return;
   }
 
-  // Transport
+    // Transport
   if (key === ' ') {
-  ensureAudioRunning();
-  isPlaying = !isPlaying;
-  return;
-}
+    ensureAudioRunning();
+    isPlaying = !isPlaying;
+    return;
   }
   if (key === ',') {
     bpm = max(20, bpm - 5);
