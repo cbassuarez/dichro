@@ -6,6 +6,21 @@
 
 const GRID_COLS = 8;
 const GRID_ROWS = 6;
+const MAX_SCENES = 4;
+
+let scenes = new Array(MAX_SCENES).fill(null);
+
+let playMode = false;
+let sweep = {
+  pos: 0,
+  speed: 0.6,    // rows per second
+  width: 0.8,    // highlight band width in rows
+  autoAdvance: true
+};
+let prevSweepPos = 0;
+
+let shapeScale = 1.0;      // global shape size scalar
+let brightnessOverlay = 0; // -0.7..0.7, negative = darker, positive = lighter
 
 const paletteDefs = [
   {
@@ -68,16 +83,67 @@ function setup() {
   buildTilesFromSeed();
 }
 
+function updateSweep(dt) {
+  prevSweepPos = sweep.pos;
+  sweep.pos += dt * sweep.speed;
+
+  // Wrap in [0, GRID_ROWS)
+  if (sweep.pos >= GRID_ROWS) sweep.pos -= GRID_ROWS;
+  if (sweep.pos < 0) sweep.pos += GRID_ROWS;
+
+  if (!sweep.autoAdvance) return;
+
+  // Auto-advance tiles once when the band’s center crosses a row center
+  for (let i = 0; i < tiles.length; i++) {
+    const tile = tiles[i];
+    const centerRow = tile.row + 0.5;
+
+    let prev = prevSweepPos;
+    let curr = sweep.pos;
+    let tileCenter = centerRow;
+
+    // handle wrap-around (always move "forward" in row space)
+    if (curr < prev) curr += GRID_ROWS;
+    if (tileCenter < prev) tileCenter += GRID_ROWS;
+
+    if (prev <= tileCenter && curr > tileCenter) {
+      advanceTileState(tile, +1);
+    }
+  }
+}
+
+function drawBrightnessOverlay() {
+  const amount = abs(brightnessOverlay);
+  if (amount <= 0.0001) return;
+
+  const alpha = map(amount, 0, 0.7, 0, 120);
+  noStroke();
+  if (brightnessOverlay > 0) {
+    fill(255, 255, 255, alpha);
+  } else {
+    fill(0, 0, 0, alpha);
+  }
+  rect(0, 0, width, height);
+}
+
 function draw() {
   const palette = currentPalette();
   background(palette.bg);
 
   const dt = deltaTime / 1000.0;
 
+  if (playMode) {
+    updateSweep(dt);
+  }
+
   // tiles
   for (let i = 0; i < tiles.length; i++) {
     updateTile(tiles[i], dt);
     drawTile(tiles[i], palette);
+  }
+
+  if (brightnessOverlay !== 0) {
+    drawBrightnessOverlay();
   }
 
   if (showGrid) {
@@ -102,6 +168,40 @@ function computeGridMetrics() {
   gridMetrics.cellW = gridW / GRID_COLS;
   gridMetrics.cellH = gridH / GRID_ROWS;
 }
+function moduleTypeForCol(col) {
+  // Map columns into four bands: circle, bar, block, diagonal
+  const bandCount = MODULE_TYPES.length; // 4
+  const segment = floor(map(col, 0, GRID_COLS, 0, bandCount));
+  return MODULE_TYPES[constrain(segment, 0, bandCount - 1)];
+}
+
+function densityBiasForRow(row) {
+  // 0 at top row (sparse), 1 at bottom row (dense)
+  if (GRID_ROWS <= 1) return 0.5;
+  return row / (GRID_ROWS - 1);
+}
+
+function emptyStateIndex(type) {
+  if (type === 'circle') return 5;
+  return 4;
+}
+
+function pickInitialState(moduleType, row) {
+  const n = moduleStateCount(moduleType);
+  const emptyIndex = emptyStateIndex(moduleType);
+  const bias = densityBiasForRow(row); // 0 top (more empties), 1 bottom (fewer empties)
+  const r = random();
+
+  if (r > bias) {
+    // Prefer empty in sparser rows
+    return emptyIndex;
+  } else {
+    // Choose a non-empty state
+    let s = floor(random(n - 1));
+    if (s >= emptyIndex) s++;
+    return s;
+  }
+}
 
 function buildTilesFromSeed() {
   randomSeed(currentSeed);
@@ -110,9 +210,9 @@ function buildTilesFromSeed() {
 
   for (let row = 0; row < GRID_ROWS; row++) {
     for (let col = 0; col < GRID_COLS; col++) {
-      const moduleType = randomModuleType();
+      const moduleType = moduleTypeForCol(col);
       const stateCount = moduleStateCount(moduleType);
-      const initialState = floor(random(stateCount));
+      const initialState = pickInitialState(moduleType, row);
       const role = pickRole();
 
       const { x0, y0, cellW, cellH } = gridMetrics;
@@ -133,7 +233,9 @@ function buildTilesFromSeed() {
         animActive: false,
         animT: 1,
         animDuration: 0.22, // seconds
-        animDirection: random([-1, 1])
+        animDirection: random([-1, 1]),
+        clickCount: 0,
+        lastChangedFrame: -1
       });
     }
   }
@@ -209,10 +311,31 @@ function updateTile(tile, dt) {
 function drawTile(tile, palette) {
   const cx = tile.x + tile.w / 2;
   const cy = tile.y + tile.h / 2;
-  const size = min(tile.w, tile.h) * 0.78;
+  const size = min(tile.w, tile.h) * 0.78 * shapeScale;
 
   const baseColor = getFillForTile(tile, palette);
   const bg = palette.bg;
+
+  // Sweep highlight (behind the module)
+  if (playMode) {
+    const rowCenter = tile.row + 0.5;
+    let sweepPos = sweep.pos % GRID_ROWS;
+    if (sweepPos < 0) sweepPos += GRID_ROWS;
+
+    let d = abs(rowCenter - sweepPos);
+    // shortest distance accounting for wrap-around
+    d = min(d, GRID_ROWS - d);
+
+    let intensity = max(0, 1 - d / sweep.width);
+    if (intensity > 0) {
+      push();
+      noStroke();
+      const alpha = 18 * intensity;
+      fill(255, 255, 255, alpha);
+      rect(tile.x, tile.y, tile.w, tile.h);
+      pop();
+    }
+  }
 
   // animation: gentle pulse + tiny rotation
   let t = tile.animT;
@@ -241,7 +364,24 @@ function drawTile(tile, palette) {
       break;
   }
 
+  // Ghost / history overlay — faint inner frame for "hot" tiles
+  if (tile.clickCount && tile.clickCount > 0) {
+    const influence = constrain(Math.log(tile.clickCount + 1) / Math.log(10), 0, 1);
+    const alpha = 30 * influence;
+    noFill();
+    stroke(0, 0, 0, alpha);
+    strokeWeight(1);
+    rectMode(CENTER);
+    const ghostSize = size * 0.92;
+    rect(0, 0, ghostSize, ghostSize, ghostSize * 0.1);
+    noStroke();
+  }
+
   pop();
+}
+function registerTileChange(tile) {
+  tile.clickCount = (tile.clickCount || 0) + 1;
+  tile.lastChangedFrame = frameCount;
 }
 
 // -------------------- module drawing --------------------
@@ -427,15 +567,16 @@ function findTileAt(px, py) {
 function advanceTileState(tile, direction) {
   const n = tile.stateCount;
   tile.state = ((tile.state + direction) % n + n) % n;
+  registerTileChange(tile);
   triggerTileAnimation(tile);
 }
 
 function changeTileModule(tile) {
-  // choose a different module type than current
   const others = MODULE_TYPES.filter((m) => m !== tile.moduleType);
   tile.moduleType = random(others);
   tile.stateCount = moduleStateCount(tile.moduleType);
   tile.state = constrain(tile.state, 0, tile.stateCount - 1);
+  registerTileChange(tile);
   triggerTileAnimation(tile, true);
 }
 
@@ -447,6 +588,7 @@ function triggerTileAnimation(tile, hard) {
 }
 
 function keyPressed() {
+  // HUD + grid toggles
   if (key === 'H') {
     showHUD = !showHUD;
     return;
@@ -455,21 +597,93 @@ function keyPressed() {
     showGrid = !showGrid;
     return;
   }
+
+  // Scenes on Q/W/E/R: Shift+key = store, key = recall
+  if (key === 'Q') {
+    if (keyIsDown(SHIFT)) storeScene(0);
+    else recallScene(0);
+    return;
+  }
+  if (key === 'W') {
+    if (keyIsDown(SHIFT)) storeScene(1);
+    else recallScene(1);
+    return;
+  }
+  if (key === 'E') {
+    if (keyIsDown(SHIFT)) storeScene(2);
+    else recallScene(2);
+    return;
+  }
   if (key === 'R') {
+    if (keyIsDown(SHIFT)) storeScene(3);
+    else recallScene(3);
+    return;
+  }
+
+  // New seed / reroll layout (moved from 'R' to 'N')
+  if (key === 'N') {
     currentSeed = floor(random(1e9));
     buildTilesFromSeed();
     return;
   }
+
+  // Save PNG + JSON snapshot
   if (key === 'S') {
     saveComposition();
     return;
   }
 
-  // palettes: 1–4
-  if (key === '1') paletteIndex = 0;
-  if (key === '2') paletteIndex = 1;
-  if (key === '3') paletteIndex = 2;
-  if (key === '4') paletteIndex = 3;
+  // Palettes: 1–4
+  if (key === '1') {
+    paletteIndex = 0;
+    return;
+  }
+  if (key === '2') {
+    paletteIndex = 1;
+    return;
+  }
+  if (key === '3') {
+    paletteIndex = 2;
+    return;
+  }
+  if (key === '4') {
+    paletteIndex = 3;
+    return;
+  }
+
+  // Play mode + sweep
+  if (key === 'P') {
+    playMode = !playMode;
+    return;
+  }
+  if (key === '-') {
+    sweep.speed = max(0.1, sweep.speed - 0.1);
+    return;
+  }
+  if (key === '=') {
+    sweep.speed = min(3.0, sweep.speed + 0.1);
+    return;
+  }
+
+  // Global scale macros
+  if (key === 'Z') {
+    shapeScale = constrain(shapeScale + 0.08, 0.7, 1.4);
+    return;
+  }
+  if (key === 'X') {
+    shapeScale = constrain(shapeScale - 0.08, 0.7, 1.4);
+    return;
+  }
+
+  // Brightness macros
+  if (key === 'L') {
+    brightnessOverlay = constrain(brightnessOverlay + 0.1, -0.7, 0.7);
+    return;
+  }
+  if (key === 'K') {
+    brightnessOverlay = constrain(brightnessOverlay - 0.1, -0.7, 0.7);
+    return;
+  }
 }
 
 function windowResized() {
@@ -503,12 +717,15 @@ function drawHUD() {
   const pad = 12;
   const lineH = 16;
 
-  const lines = [
+    const lines = [
     `palette: ${palette.name}`,
     `seed: ${currentSeed}`,
     `grid: ${GRID_COLS} × ${GRID_ROWS}`,
+    `mode: ${playMode ? 'play (sweep)' : 'edit (click)'}`,
     `click: next · shift+click: back · alt+click: module`,
-    `[1–4] palette · [R] reroll · [S] save · [G] grid · [H] HUD`
+    `[1–4] palette · [N] new seed · [S] save · [G] grid · [H] HUD`,
+    `[QWER] recall scenes · Shift+QWER store scenes`,
+    `[P] play sweep · [-/=] sweep speed · [Z/X] scale · [L/K] light/dark`
   ];
 
   const boxW = 380;
@@ -553,6 +770,47 @@ function saveComposition() {
 
   console.log('Clickfield snapshot:', snapshot);
   console.log('JSON:', JSON.stringify(snapshot));
+}
+
+function storeScene(index) {
+  if (index < 0 || index >= MAX_SCENES) return;
+
+  scenes[index] = {
+    paletteIndex,
+    seed: currentSeed,
+    cols: GRID_COLS,
+    rows: GRID_ROWS,
+    tiles: tiles.map((t) => ({
+      moduleType: t.moduleType,
+      state: t.state,
+      role: t.role
+    }))
+  };
+
+  console.log(`Stored scene ${index} (palette: ${currentPalette().name}, seed: ${currentSeed})`);
+}
+
+function recallScene(index) {
+  const scene = scenes[index];
+  if (!scene) return;
+
+  if (scene.cols !== GRID_COLS || scene.rows !== GRID_ROWS) {
+    console.warn('Scene grid size does not match current grid; ignoring.');
+    return;
+  }
+
+  paletteIndex = scene.paletteIndex % paletteDefs.length;
+
+  for (let i = 0; i < tiles.length && i < scene.tiles.length; i++) {
+    const snap = scene.tiles[i];
+    const tile = tiles[i];
+
+    tile.moduleType = snap.moduleType;
+    tile.stateCount = moduleStateCount(tile.moduleType);
+    tile.state = constrain(snap.state, 0, tile.stateCount - 1);
+    tile.role = snap.role;
+    triggerTileAnimation(tile, true);
+  }
 }
 
 // -------------------- utils --------------------
