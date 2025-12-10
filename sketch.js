@@ -1,8 +1,8 @@
-// Bauhaus Clickfield — Ripple Sequencer with Audio
-// - Grid of clickable modules (circle/bar/block/diagonal).
-// - Ripple sequencer emanating from an origin tile (default: center).
+// Bauhaus Clickfield — Radial Ripple Lab
+// - Grid of clickable modules (circle / bar / block / diagonal).
+// - Continuous radial ripple emanating from an origin tile (default: center).
 // - Long-press on a tile sets origin.
-// - Web Audio-based tone "grains" per tile as ripple passes.
+// - Web Audio-based tone "grains" per tile as the wave passes.
 // - Glyph type and color are independent properties.
 //
 // Controls:
@@ -24,6 +24,7 @@
 //   L / K          : global light/dark overlay
 //   G              : toggle grid overlay
 //   H              : toggle chrome
+//   A              : test beep (audio sanity check)
 
 // -------------------- config --------------------
 
@@ -88,15 +89,13 @@ let shapeScale = 1.0;      // global shape size
 let brightnessOverlay = 0; // -0.7..0.7
 
 // Ripple sequencer state
-// Ripple sequencer state
 let isPlaying = false;
 let bpm = 96;
 let rippleSpeed = 1.0; // multiplier on bpm timing
 
 let originTile = null;
-let maxRippleRing = 0;   // still tracked but not central
-let maxRippleDist = 0;   // max Euclidean distance from origin
-let ripplePhase = 0;     // continuous phase of the radial wave
+let maxRippleDist = 0; // max Euclidean distance from origin
+let ripplePhase = 0;   // continuous phase of the radial wave
 
 // Pointer for long-press origin selection
 let pointerDownTile = null;
@@ -145,6 +144,11 @@ function draw() {
   if (showHUD) {
     drawChrome();
   }
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  updateTileGeometry();
 }
 
 // -------------------- layout & seeding --------------------
@@ -218,8 +222,8 @@ function buildTilesFromSeed() {
         y,
         w: cellW,
         h: cellH,
-        moduleType,           // glyph type
-        state: initialState,  // glyph state
+        moduleType,              // glyph type
+        state: initialState,     // glyph state
         stateCount,
         colorIndex: floor(random(3)), // 0: primary, 1: secondary, 2: accent
         animActive: false,
@@ -228,7 +232,9 @@ function buildTilesFromSeed() {
         animDirection: random([-1, 1]),
         clickCount: 0,
         lastChangedFrame: -1,
-        ring: 0 // ripple ring index (Manhattan distance from origin)
+        dist: 0,        // Euclidean distance from origin
+        prevAmp: 0,     // previous ripple amplitude
+        currentAmp: 0   // current ripple amplitude
       });
     }
   }
@@ -256,7 +262,7 @@ function initRippleOrigin() {
     findTileAtGridIndex(floor(GRID_COLS / 2), floor(GRID_ROWS / 2)) ||
     tiles[0] ||
     null;
-  computeRippleRings();
+  computeRippleDistances();
   ripplePhase = 0;
 }
 
@@ -268,21 +274,17 @@ function findTileAtGridIndex(col, row) {
   return null;
 }
 
-function computeRippleRings() {
+function computeRippleDistances() {
   if (!originTile) return;
-  maxRippleRing = 0;
   maxRippleDist = 0;
   for (let i = 0; i < tiles.length; i++) {
     const t = tiles[i];
     const dx = t.col - originTile.col;
     const dy = t.row - originTile.row;
-    // keep ring if you ever want stepped modes later
-    t.ring = abs(dx) + abs(dy); // Manhattan distance (legacy)
-    const d = Math.sqrt(dx * dx + dy * dy); // Euclidean distance
+    const d = Math.sqrt(dx * dx + dy * dy);
     t.dist = d;
     t.prevAmp = 0;
     t.currentAmp = 0;
-    if (t.ring > maxRippleRing) maxRippleRing = t.ring;
     if (d > maxRippleDist) maxRippleDist = d;
   }
 }
@@ -307,7 +309,7 @@ function updateRipple(dt) {
     // sharpen the peak a little
     amp = Math.pow(amp, 1.6);
 
-    const prev = tile.prevAmp ?? 0;
+    const prev = tile.prevAmp;
     tile.currentAmp = amp;
 
     // trigger when we cross threshold upward
@@ -341,10 +343,6 @@ function moduleStateCount(type) {
   }
 }
 
-function randomModuleType() {
-  return random(MODULE_TYPES);
-}
-
 function currentPalette() {
   return paletteDefs[paletteIndex % paletteDefs.length];
 }
@@ -373,7 +371,6 @@ function drawTile(tile, palette) {
   const baseColor = getFillForTile(tile, palette);
   const bg = palette.bg;
 
-  // Ripple ring highlight
   const amp = isPlaying && tile.currentAmp != null ? tile.currentAmp : 0;
 
   // Continuous ripple highlight: stronger amp = brighter
@@ -385,7 +382,6 @@ function drawTile(tile, palette) {
     rect(tile.x, tile.y, tile.w, tile.h);
     pop();
   }
-
 
   // animation: gentle pulse + tiny rotation, modulated by ripple amp
   let t = tile.animT;
@@ -400,8 +396,6 @@ function drawTile(tile, palette) {
   translate(cx, cy);
   scale(pulse);
   rotate(rot);
-
-
 
   switch (tile.moduleType) {
     case 'circle':
@@ -604,23 +598,23 @@ function mouseReleased() {
   if (tile && tile === pointerDownTile && pressDuration >= LONG_PRESS_MS) {
     // Long press: set new origin for ripple
     originTile = tile;
-computeRippleRings();
-ripplePhase = 0;
-triggerTileAnimation(tile, true);
+    computeRippleDistances();
+    ripplePhase = 0;
+    triggerTileAnimation(tile, true);
   } else if (tile && tile === pointerDownTile) {
-  // Short click: normal state changes
-  const alt = keyIsDown(ALT);
-  const shift = keyIsDown(SHIFT);
+    // Short click: normal state changes
+    const alt = keyIsDown(ALT);
+    const shift = keyIsDown(SHIFT);
 
-  if (alt) {
-    changeTileModule(tile);
-  } else {
-    advanceTileState(tile, shift ? -1 : 1);
-  }
+    if (alt) {
+      changeTileModule(tile);
+    } else {
+      advanceTileState(tile, shift ? -1 : 1);
+    }
 
     // audible feedback on click
-  triggerGrainFromTile(tile, 1.0);
-}
+    triggerGrainFromTile(tile, 1.0);
+  }
 
   pointerDownTile = null;
 }
@@ -643,8 +637,9 @@ function advanceTileState(tile, direction) {
 }
 
 function changeTileModule(tile) {
-  const others = MODULE_TYPES.filter((m) => m !== tile.moduleType);
-  tile.moduleType = random(others);
+  const current = tile.moduleType;
+  const choices = MODULE_TYPES.filter((m) => m !== current);
+  tile.moduleType = random(choices);
   tile.stateCount = moduleStateCount(tile.moduleType);
   tile.state = constrain(tile.state, 0, tile.stateCount - 1);
   registerTileChange(tile);
@@ -664,6 +659,12 @@ function triggerTileAnimation(tile, hard) {
 }
 
 function keyPressed() {
+  // Audio sanity check
+  if (key === 'A') {
+    testBeep();
+    return;
+  }
+
   // Toggle chrome
   if (key === 'H') {
     showHUD = !showHUD;
@@ -676,7 +677,7 @@ function keyPressed() {
     return;
   }
 
-    // Transport
+  // Transport
   if (key === ' ') {
     ensureAudioRunning();
     isPlaying = !isPlaying;
@@ -763,11 +764,6 @@ function keyPressed() {
     brightnessOverlay = constrain(brightnessOverlay - 0.1, -0.7, 0.7);
     return;
   }
-}
-
-function windowResized() {
-  resizeCanvas(windowWidth, windowHeight);
-  updateTileGeometry();
 }
 
 // -------------------- chrome & overlays --------------------
@@ -900,7 +896,7 @@ function recallScene(index) {
     triggerTileAnimation(tile, true);
   }
 
-  computeRippleRings();
+  computeRippleDistances();
 }
 
 function saveComposition() {
@@ -1033,6 +1029,31 @@ function triggerGrainFromTile(tile, amp) {
     gain.connect(masterGain);
   }
 }
+
+function testBeep() {
+  ensureAudioRunning();
+  if (!audioCtx) return;
+
+  const ctx = audioCtx;
+  const now = ctx.currentTime;
+
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+
+  osc.type = 'sine';
+  osc.frequency.value = 440;
+
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(0.3, now + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+
+  osc.connect(gain);
+  gain.connect(masterGain);
+
+  osc.start(now);
+  osc.stop(now + 0.3);
+}
+
 // -------------------- utils --------------------
 
 function getSeedFromURL() {
