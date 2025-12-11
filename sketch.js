@@ -94,8 +94,9 @@ let bpm = 96;
 let rippleSpeed = 1.0; // multiplier on bpm timing
 
 let originTile = null;
-let maxRippleDist = 0; // max Euclidean distance from origin
-let ripplePhase = 0;   // continuous phase of the radial wave
+let maxRippleDist = 0;     // max Euclidean distance from origin
+let ripplePos = 0;         // current radial position of the wave (in distance units)
+let rippleCycleLength = 0; // how far the wave travels before wrapping
 
 // Pointer for long-press origin selection
 let pointerDownTile = null;
@@ -263,7 +264,6 @@ function initRippleOrigin() {
     tiles[0] ||
     null;
   computeRippleDistances();
-  ripplePhase = 0;
 }
 
 function findTileAtGridIndex(col, row) {
@@ -277,6 +277,7 @@ function findTileAtGridIndex(col, row) {
 function computeRippleDistances() {
   if (!originTile) return;
   maxRippleDist = 0;
+
   for (let i = 0; i < tiles.length; i++) {
     const t = tiles[i];
     const dx = t.col - originTile.col;
@@ -287,27 +288,45 @@ function computeRippleDistances() {
     t.currentAmp = 0;
     if (d > maxRippleDist) maxRippleDist = d;
   }
+
+  // Let the wave travel a bit beyond the furthest tile before wrapping
+  rippleCycleLength = maxRippleDist + 2.0;
+  ripplePos = 0;
 }
 
 function updateRipple(dt) {
-  if (!originTile) return;
+  if (!originTile || maxRippleDist <= 0) return;
 
-  // continuous phase advance: bpm * rippleSpeed controls speed
-  const cyclesPerSecond = (bpm / 60) * rippleSpeed;
-  ripplePhase += dt * cyclesPerSecond * TWO_PI;
+  // bpm + rippleSpeed → radial speed (distance units per second)
+  const beatsPerSecond = (bpm / 60) * rippleSpeed;
 
-  const radialSpacing = PI / 2.0; // radians per unit of distance
+  // Wave reaches max radius in ~2 beats (tweakable)
+  const distancePerBeat = maxRippleDist / 2.0;
+  const radialSpeed = beatsPerSecond * distancePerBeat;
+
+  ripplePos += radialSpeed * dt;
+
+  if (rippleCycleLength <= 0) {
+    rippleCycleLength = maxRippleDist + 2.0;
+  }
+  // wrap ripple position so the wave keeps cycling
+  if (ripplePos > rippleCycleLength) {
+    ripplePos -= rippleCycleLength * Math.floor(ripplePos / rippleCycleLength);
+  }
+
   const triggerThreshold = 0.7;
+  const width = 0.9; // thickness of the wavefront in distance units
 
   for (let i = 0; i < tiles.length; i++) {
     const tile = tiles[i];
     if (tile.dist == null) continue;
 
-    const phaseAtTile = ripplePhase - tile.dist * radialSpacing;
-    // base cosine, shifted into [0, 1]
-    let amp = (Math.cos(phaseAtTile) + 1) * 0.5;
-    // sharpen the peak a little
-    amp = Math.pow(amp, 1.6);
+    const d = tile.dist;
+    const delta = Math.abs(d - ripplePos);
+    const x = delta / width;
+
+    // Gaussian-ish "shell" around the wavefront
+    let amp = Math.exp(-0.5 * x * x);
 
     const prev = tile.prevAmp;
     tile.currentAmp = amp;
@@ -599,7 +618,6 @@ function mouseReleased() {
     // Long press: set new origin for ripple
     originTile = tile;
     computeRippleDistances();
-    ripplePhase = 0;
     triggerTileAnimation(tile, true);
   } else if (tile && tile === pointerDownTile) {
     // Short click: normal state changes
@@ -951,58 +969,132 @@ function triggerGrainFromTile(tile, amp) {
   ensureAudioRunning();
   if (!audioCtx) return;
 
-  const ctx = audioCtx;
-  const now = ctx.currentTime;
+  switch (tile.moduleType) {
+    case 'circle':
+      // bell / chime
+      playBellGrain(tile, amp);
+      break;
+    case 'bar':
+      // woodblock-ish tick
+      playWoodBlockGrain(tile, amp);
+      break;
+    case 'block':
+      // chord cluster
+      playChordGrain(tile, amp);
+      break;
+    case 'diagonal':
+      // metallic / FM-y
+      playMetallicGrain(tile, amp);
+      break;
+    default:
+      playBellGrain(tile, amp);
+      break;
+  }
+}
 
-  // Map row to a simple pitch ladder (major-ish)
+function baseFreqForTile(tile, octaveOffset = 0) {
+  // Simple scale over rows, transposed by octaveOffset
   const scale = [0, 2, 4, 7, 9, 12]; // semitones
   const degree = scale[tile.row % scale.length];
-  const octave = 3 + floor(tile.row / scale.length);
-  const midi = 12 * octave + degree; // rough MIDI note
-  let freq = 440 * Math.pow(2, (midi - 69) / 12);
+  const octave = 3 + floor(tile.row / scale.length) + octaveOffset;
+  const midi = 12 * octave + degree;
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
 
-  const stateNorm =
-    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
-  const distNorm = maxRippleDist > 0 ? (tile.dist || 0) / maxRippleDist : 0.0;
-  const energy = amp != null ? amp : 1.0;
+function connectVoiceToOutput(gainNode, tile) {
+  const ctx = audioCtx;
+  if (!ctx || !masterGain) return;
 
-  // Slight frequency warping by state
-  freq *= lerp(0.8, 1.4, 0.3 + 0.4 * stateNorm);
-
-  // Oscillator type based on glyph type
-  let type = 'sine';
-  if (tile.moduleType === 'bar') type = 'square';
-  else if (tile.moduleType === 'block') type = 'triangle';
-  else if (tile.moduleType === 'diagonal') type = 'sawtooth';
-
-  const osc = ctx.createOscillator();
-  osc.type = type;
-  osc.frequency.value = freq;
-
-  // Envelope & pan
-  const gain = ctx.createGain();
   const panNode = ctx.createStereoPanner
     ? ctx.createStereoPanner()
     : null;
 
-  // Duration depends on module/state
-  let baseDur = 0.12;
-  if (tile.moduleType === 'circle') baseDur = 0.18;
-  if (tile.moduleType === 'bar') baseDur = 0.10;
-  if (tile.moduleType === 'block') baseDur = 0.16;
-  if (tile.moduleType === 'diagonal') baseDur = 0.14;
+  if (panNode) {
+    const panVal = lerp(
+      -0.8,
+      0.8,
+      GRID_COLS > 1 ? tile.col / (GRID_COLS - 1) : 0.5
+    );
+    panNode.pan.setValueAtTime(panVal, ctx.currentTime);
+    gainNode.connect(panNode);
+    panNode.connect(masterGain);
+  } else {
+    gainNode.connect(masterGain);
+  }
+}
 
-  const dur = lerp(baseDur * 0.6, baseDur * 1.4, stateNorm);
+function playBellGrain(tile, amp = 1.0) {
+  const ctx = audioCtx;
+  if (!ctx) return;
 
-  // Velocity from colorIndex, distance and energy of the wave
+  const now = ctx.currentTime;
+  const freq = baseFreqForTile(tile, 0);
+
+  const osc1 = ctx.createOscillator();
+  const osc2 = ctx.createOscillator();
+  const gain = ctx.createGain();
+
+  osc1.type = 'sine';
+  osc2.type = 'sine';
+  osc1.frequency.value = freq;
+  osc2.frequency.value = freq * 2.01; // slightly detuned upper partial
+
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+
+  const duration = lerp(0.25, 0.9, amp);
+  const attack = 0.005;
+  const release = duration;
+
   let vel = 0.18;
   if (tile.colorIndex === 2) vel *= 1.4; // accent
   if (tile.colorIndex === 1) vel *= 0.85; // secondary
-  vel *= lerp(0.8, 1.2, distNorm);
-  vel *= lerp(0.6, 1.3, energy);
+  vel *= lerp(0.7, 1.3, amp);
+  vel *= lerp(0.8, 1.2, stateNorm);
 
-  const attack = 0.005;
-  const release = dur * 0.85;
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(vel, now + attack);
+  gain.gain.exponentialRampToValueAtTime(
+    0.0001,
+    now + attack + release
+  );
+
+  osc1.start(now);
+  osc2.start(now);
+  osc1.stop(now + attack + release + 0.05);
+  osc2.stop(now + attack + release + 0.05);
+
+  osc1.connect(gain);
+  osc2.connect(gain);
+  connectVoiceToOutput(gain, tile);
+}
+
+function playWoodBlockGrain(tile, amp = 1.0) {
+  const ctx = audioCtx;
+  if (!ctx) return;
+
+  const now = ctx.currentTime;
+  const freq = baseFreqForTile(tile, 1) * 2; // higher, more percussive
+
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+
+  osc.type = 'square';
+  // quick downward pitch sweep
+  osc.frequency.setValueAtTime(freq * 1.1, now);
+  osc.frequency.linearRampToValueAtTime(freq * 0.7, now + 0.04);
+
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+
+  const duration = lerp(0.04, 0.14, 1.0 - stateNorm);
+  const attack = 0.001;
+  const release = duration * 0.9;
+
+  let vel = 0.22;
+  if (tile.colorIndex === 2) vel *= 1.2;
+  if (tile.colorIndex === 1) vel *= 0.9;
+  vel *= lerp(0.7, 1.3, amp);
 
   gain.gain.setValueAtTime(0, now);
   gain.gain.linearRampToValueAtTime(vel, now + attack);
@@ -1012,22 +1104,116 @@ function triggerGrainFromTile(tile, amp) {
   );
 
   osc.start(now);
-  osc.stop(now + attack + release + 0.02);
+  osc.stop(now + attack + release + 0.05);
 
-  if (panNode) {
-    const panVal = lerp(
-      -0.8,
-      0.8,
-      GRID_COLS > 1 ? tile.col / (GRID_COLS - 1) : 0.5
-    );
-    panNode.pan.setValueAtTime(panVal, now);
-    osc.connect(gain);
-    gain.connect(panNode);
-    panNode.connect(masterGain);
-  } else {
-    osc.connect(gain);
-    gain.connect(masterGain);
-  }
+  osc.connect(gain);
+  connectVoiceToOutput(gain, tile);
+}
+
+function playChordGrain(tile, amp = 1.0) {
+  const ctx = audioCtx;
+  if (!ctx) return;
+
+  const now = ctx.currentTime;
+  const root = baseFreqForTile(tile, 0);
+  const third = root * (5 / 4); // major-ish 3rd
+  const fifth = root * (3 / 2); // 5th
+
+  const osc1 = ctx.createOscillator();
+  const osc2 = ctx.createOscillator();
+  const osc3 = ctx.createOscillator();
+  const gain = ctx.createGain();
+
+  osc1.type = 'triangle';
+  osc2.type = 'triangle';
+  osc3.type = 'triangle';
+  osc1.frequency.value = root;
+  osc2.frequency.value = third;
+  osc3.frequency.value = fifth;
+
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+
+  const duration = lerp(0.18, 0.6, stateNorm);
+  const attack = 0.006;
+  const release = duration;
+
+  let vel = 0.16;
+  if (tile.colorIndex === 2) vel *= 1.3;
+  if (tile.colorIndex === 1) vel *= 0.85;
+  vel *= lerp(0.7, 1.3, amp);
+
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(vel, now + attack);
+  gain.gain.exponentialRampToValueAtTime(
+    0.0001,
+    now + attack + release
+  );
+
+  osc1.start(now);
+  osc2.start(now);
+  osc3.start(now);
+  osc1.stop(now + attack + release + 0.05);
+  osc2.stop(now + attack + release + 0.05);
+  osc3.stop(now + attack + release + 0.05);
+
+  osc1.connect(gain);
+  osc2.connect(gain);
+  osc3.connect(gain);
+  connectVoiceToOutput(gain, tile);
+}
+
+function playMetallicGrain(tile, amp = 1.0) {
+  const ctx = audioCtx;
+  if (!ctx) return;
+
+  const now = ctx.currentTime;
+  const base = baseFreqForTile(tile, 0);
+
+  const osc = ctx.createOscillator();
+  const modOsc = ctx.createOscillator();
+  const modGain = ctx.createGain();
+  const gain = ctx.createGain();
+
+  osc.type = 'sine';
+  modOsc.type = 'sine';
+  osc.frequency.value = base;
+
+  const modDepth = base * 0.3;
+  modGain.gain.value = modDepth;
+  modOsc.frequency.value = base * 2.5;
+
+  // mod oscillator -> gain -> osc.frequency (FM)
+  modOsc.connect(modGain);
+  modGain.connect(osc.frequency);
+
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+
+  const duration = lerp(0.18, 0.7, amp);
+  const attack = 0.003;
+  const release = duration;
+
+  let vel = 0.14;
+  if (tile.colorIndex === 2) vel *= 1.4;
+  if (tile.colorIndex === 1) vel *= 0.9;
+  vel *= lerp(0.7, 1.3, amp);
+  vel *= lerp(0.8, 1.2, stateNorm);
+
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(vel, now + attack);
+  gain.gain.exponentialRampToValueAtTime(
+    0.0001,
+    now + attack + release
+  );
+
+  osc.start(now);
+  modOsc.start(now);
+  osc.stop(now + attack + release + 0.05);
+  modOsc.stop(now + attack + release + 0.05);
+
+  osc.connect(gain);
+  connectVoiceToOutput(gain, tile);
 }
 
 function testBeep() {
