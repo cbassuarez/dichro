@@ -1,9 +1,11 @@
-// Bauhaus Clickfield — Radial Ripple Lab
+// Bauhaus Clickfield — Radial Ripple Lab (7-limit JI)
 // - Grid of clickable modules (circle / bar / block / diagonal).
 // - Continuous radial ripple emanating from an origin tile (default: center).
 // - Long-press on a tile sets origin.
 // - Web Audio-based tone "grains" per tile as the wave passes.
 // - Glyph type and color are independent properties.
+// - Tuning: 7-limit just intonation
+// - Polyphony: capped to number of tiles on screen.
 //
 // Controls:
 //   Click          : advance tile state
@@ -66,6 +68,19 @@ const MODULE_TYPES = ['circle', 'bar', 'block', 'diagonal'];
 const MAX_SCENES = 4;
 const LONG_PRESS_MS = 400;
 
+// 7-limit JI pitch lattice (uses primes 2,3,5,7)
+const JI_RATIOS = [
+  1 / 1,  // unison
+  8 / 7,  // septimal major second
+  7 / 6,  // septimal minor third
+  5 / 4,  // major third
+  4 / 3,  // perfect fourth
+  7 / 5,  // septimal tritone
+  3 / 2,  // perfect fifth
+  5 / 3,  // major sixth
+  7 / 4   // harmonic seventh
+];
+
 // -------------------- globals --------------------
 
 let tiles = [];
@@ -105,6 +120,32 @@ let pointerDownTime = 0;
 // Web Audio
 let audioCtx = null;
 let masterGain = null;
+
+// Global grain concurrency limiter
+let activeGrainCount = 0;
+
+function maxConcurrentGrains() {
+  // Never allow more active grains than modules on screen
+  const count = tiles && tiles.length ? tiles.length : GRID_COLS * GRID_ROWS;
+  return max(1, count);
+}
+
+function beginGrain(totalDurationSeconds) {
+  const maxGrains = maxConcurrentGrains();
+  if (activeGrainCount >= maxGrains) {
+    // drop this grain if we’re already at capacity
+    return false;
+  }
+
+  activeGrainCount++;
+
+  const decayMs = (totalDurationSeconds + 0.05) * 1000; // small safety pad
+  setTimeout(() => {
+    activeGrainCount = max(0, activeGrainCount - 1);
+  }, decayMs);
+
+  return true;
+}
 
 // -------------------- setup / draw --------------------
 
@@ -993,12 +1034,18 @@ function triggerGrainFromTile(tile, amp) {
 }
 
 function baseFreqForTile(tile, octaveOffset = 0) {
-  // Simple scale over rows, transposed by octaveOffset
-  const scale = [0, 2, 4, 7, 9, 12]; // semitones
-  const degree = scale[tile.row % scale.length];
-  const octave = 3 + floor(tile.row / scale.length) + octaveOffset;
-  const midi = 12 * octave + degree;
-  return 440 * Math.pow(2, (midi - 69) / 12);
+  // 7-limit JI: each row picks a ratio from JI_RATIOS,
+  // then we stack octaves upward as we run out of ratios.
+  const root = 220; // base fundamental in Hz (A3-ish)
+
+  const idx = tile.row % JI_RATIOS.length;
+  const ratio = JI_RATIOS[idx];
+
+  const rowOct = floor(tile.row / JI_RATIOS.length);
+  const octave = rowOct + octaveOffset;
+
+  const octaveFactor = Math.pow(2, octave);
+  return root * ratio * octaveFactor;
 }
 
 function connectVoiceToOutput(gainNode, tile) {
@@ -1030,6 +1077,19 @@ function playBellGrain(tile, amp = 1.0) {
   const now = ctx.currentTime;
   const freq = baseFreqForTile(tile, 0);
 
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+
+  const duration = lerp(0.25, 0.9, amp);
+  const attack = 0.005;
+  const release = duration;
+  const totalDur = attack + release;
+
+  // concurrency guard
+  if (!beginGrain(totalDur)) {
+    return;
+  }
+
   const osc1 = ctx.createOscillator();
   const osc2 = ctx.createOscillator();
   const gain = ctx.createGain();
@@ -1038,13 +1098,6 @@ function playBellGrain(tile, amp = 1.0) {
   osc2.type = 'sine';
   osc1.frequency.value = freq;
   osc2.frequency.value = freq * 2.01; // slightly detuned upper partial
-
-  const stateNorm =
-    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
-
-  const duration = lerp(0.25, 0.9, amp);
-  const attack = 0.005;
-  const release = duration;
 
   let vel = 0.18;
   if (tile.colorIndex === 2) vel *= 1.4; // accent
@@ -1061,8 +1114,8 @@ function playBellGrain(tile, amp = 1.0) {
 
   osc1.start(now);
   osc2.start(now);
-  osc1.stop(now + attack + release + 0.05);
-  osc2.stop(now + attack + release + 0.05);
+  osc1.stop(now + totalDur + 0.05);
+  osc2.stop(now + totalDur + 0.05);
 
   osc1.connect(gain);
   osc2.connect(gain);
@@ -1076,6 +1129,18 @@ function playWoodBlockGrain(tile, amp = 1.0) {
   const now = ctx.currentTime;
   const freq = baseFreqForTile(tile, 1) * 2; // higher, more percussive
 
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+
+  const duration = lerp(0.04, 0.14, 1.0 - stateNorm);
+  const attack = 0.001;
+  const release = duration;
+  const totalDur = attack + release;
+
+  if (!beginGrain(totalDur)) {
+    return;
+  }
+
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
 
@@ -1083,13 +1148,6 @@ function playWoodBlockGrain(tile, amp = 1.0) {
   // quick downward pitch sweep
   osc.frequency.setValueAtTime(freq * 1.1, now);
   osc.frequency.linearRampToValueAtTime(freq * 0.7, now + 0.04);
-
-  const stateNorm =
-    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
-
-  const duration = lerp(0.04, 0.14, 1.0 - stateNorm);
-  const attack = 0.001;
-  const release = duration * 0.9;
 
   let vel = 0.22;
   if (tile.colorIndex === 2) vel *= 1.2;
@@ -1104,7 +1162,7 @@ function playWoodBlockGrain(tile, amp = 1.0) {
   );
 
   osc.start(now);
-  osc.stop(now + attack + release + 0.05);
+  osc.stop(now + totalDur + 0.05);
 
   osc.connect(gain);
   connectVoiceToOutput(gain, tile);
@@ -1119,6 +1177,18 @@ function playChordGrain(tile, amp = 1.0) {
   const third = root * (5 / 4); // major-ish 3rd
   const fifth = root * (3 / 2); // 5th
 
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+
+  const duration = lerp(0.18, 0.6, stateNorm);
+  const attack = 0.006;
+  const release = duration;
+  const totalDur = attack + release;
+
+  if (!beginGrain(totalDur)) {
+    return;
+  }
+
   const osc1 = ctx.createOscillator();
   const osc2 = ctx.createOscillator();
   const osc3 = ctx.createOscillator();
@@ -1130,13 +1200,6 @@ function playChordGrain(tile, amp = 1.0) {
   osc1.frequency.value = root;
   osc2.frequency.value = third;
   osc3.frequency.value = fifth;
-
-  const stateNorm =
-    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
-
-  const duration = lerp(0.18, 0.6, stateNorm);
-  const attack = 0.006;
-  const release = duration;
 
   let vel = 0.16;
   if (tile.colorIndex === 2) vel *= 1.3;
@@ -1153,9 +1216,9 @@ function playChordGrain(tile, amp = 1.0) {
   osc1.start(now);
   osc2.start(now);
   osc3.start(now);
-  osc1.stop(now + attack + release + 0.05);
-  osc2.stop(now + attack + release + 0.05);
-  osc3.stop(now + attack + release + 0.05);
+  osc1.stop(now + totalDur + 0.05);
+  osc2.stop(now + totalDur + 0.05);
+  osc3.stop(now + totalDur + 0.05);
 
   osc1.connect(gain);
   osc2.connect(gain);
@@ -1169,6 +1232,18 @@ function playMetallicGrain(tile, amp = 1.0) {
 
   const now = ctx.currentTime;
   const base = baseFreqForTile(tile, 0);
+
+  const stateNorm =
+    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
+
+  const duration = lerp(0.18, 0.7, amp);
+  const attack = 0.003;
+  const release = duration;
+  const totalDur = attack + release;
+
+  if (!beginGrain(totalDur)) {
+    return;
+  }
 
   const osc = ctx.createOscillator();
   const modOsc = ctx.createOscillator();
@@ -1187,13 +1262,6 @@ function playMetallicGrain(tile, amp = 1.0) {
   modOsc.connect(modGain);
   modGain.connect(osc.frequency);
 
-  const stateNorm =
-    tile.stateCount > 1 ? tile.state / (tile.stateCount - 1) : 0.0;
-
-  const duration = lerp(0.18, 0.7, amp);
-  const attack = 0.003;
-  const release = duration;
-
   let vel = 0.14;
   if (tile.colorIndex === 2) vel *= 1.4;
   if (tile.colorIndex === 1) vel *= 0.9;
@@ -1209,8 +1277,8 @@ function playMetallicGrain(tile, amp = 1.0) {
 
   osc.start(now);
   modOsc.start(now);
-  osc.stop(now + attack + release + 0.05);
-  modOsc.stop(now + attack + release + 0.05);
+  osc.stop(now + totalDur + 0.05);
+  modOsc.stop(now + totalDur + 0.05);
 
   osc.connect(gain);
   connectVoiceToOutput(gain, tile);
